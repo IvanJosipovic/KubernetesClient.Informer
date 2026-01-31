@@ -12,13 +12,59 @@ on:
   merge_group:
 
 jobs:
-  call-workflow:
+  get-version:
     permissions:
-      id-token: write
+      contents: read
+    uses: IvanJosipovic/templates/.github/workflows/create-release.yaml@main
+    with:
+      dry_run: true
+
+  build-test:
+    needs: get-version
+    permissions:
+      contents: read
+    uses: IvanJosipovic/templates/.github/workflows/csharp-build-test.yaml@main
+    with:
+      version: ${{ needs.get-version.outputs.new_release_version }}
+
+  create-release:
+    needs: build-test
+    permissions:
       contents: write
       actions: write
       checks: write
       issues: write
-      packages: write
       pull-requests: write
+    uses: IvanJosipovic/templates/.github/workflows/create-release.yaml@main
+    with:
+      dry_run: false
+
+  login:
+    name: NuGet login
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    outputs:
+      NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+    steps:
+    - name: NuGet login (OIDC → temp API key)
+      uses: NuGet/login@v1
+      id: login
+      with:
+        user: IvanJosipovic
+
+  publish-nuget:
+    needs: login
     uses: IvanJosipovic/templates/.github/workflows/csharp-publish-nuget.yaml@main
+    #secrets:
+      #NUGET_API_KEY: ${{ needs.login.outputs.NUGET_API_KEY }}
+
+# permissions:
+#   id-token: write
+#   contents: write
+#   actions: write
+#   checks: write
+#   issues: write
+#   packages: write
+#   pull-requests: write
