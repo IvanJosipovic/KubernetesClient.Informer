@@ -21,4 +21,4 @@ jobs:
       issues: write
       packages: write
       pull-requests: write
-    uses: IvanJosipovic/templates/.github/workflows/validate-renovate-config.yaml@main
+    uses: IvanJosipovic/templates/.github/workflows/csharp-publish-nuget.yaml@main
