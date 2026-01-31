@@ -42,7 +42,7 @@ jobs:
   login:
     name: NuGet login
     needs: create-release
-    if: ${{ needs.create-release.outputs.new_release_version == 'true'}}
+    if: needs.create-release.outputs.new_release_version == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
