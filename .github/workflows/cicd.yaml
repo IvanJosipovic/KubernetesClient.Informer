@@ -7,9 +7,6 @@ on:
       - 'main'
       - 'alpha'
       - 'beta'
-  pull_request:
-    types: [opened, reopened, synchronize]
-  merge_group:
 
 jobs:
   get-version:
@@ -39,24 +36,19 @@ jobs:
     with:
       dry_run: false
 
-  login:
+  publish-nuget:
     name: NuGet login
     needs: create-release
     if: needs.create-release.outputs.new_release_published == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-    outputs:
-      NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
     steps:
     - name: NuGet login
       uses: NuGet/login@v1
       id: login
       with:
         user: IvanJosipovic
-
-  publish-nuget:
-    needs: login
-    uses: IvanJosipovic/templates/.github/workflows/csharp-publish-nuget.yaml@main
-    secrets:
-      NUGET_API_KEY: ${{ needs.login.outputs.NUGET_API_KEY }}
+    - uses: IvanJosipovic/templates/.github/actions/csharp-publish-nuget@main
+      env:
+        NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
