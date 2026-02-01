@@ -37,7 +37,7 @@ jobs:
       dry_run: false
 
   publish-nuget:
-    name: NuGet login
+    name: Publish NuGet
     needs: create-release
     if: needs.create-release.outputs.new_release_published == 'true'
     runs-on: ubuntu-latest
