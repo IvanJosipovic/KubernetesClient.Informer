@@ -5,4 +5,4 @@
 [![codecov](https://codecov.io/gh/IvanJosipovic/KubernetesClient.Informer/graph/badge.svg?token=zXQwCiXAYf)](https://codecov.io/gh/IvanJosipovic/KubernetesClient.Informer)
 
 
-A Kubernetes Resource Informer implementation based on [YARP KubernetesClient.Informer](https://github.com/dotnet/yarp/tree/main/src/KubernetesClient.Informer)
+A Kubernetes Resource Informer implementation based on [Yarp.Kubernetes.Controller](https://github.com/dotnet/yarp/tree/main/src/Kubernetes.Controller)
