@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".github/renovate.json" />
+    <File Path=".releaserc.json" />
+    <File Path="global.json" />
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="src/KubernetesClient.Informer/KubernetesClient.Informer.csproj" />
+  <Project Path="tests/KubernetesClient.Informer.Tests/KubernetesClient.Informer.Tests.csproj" />
+</Solution>
+
