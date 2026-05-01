@@ -2,9 +2,12 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using k8s;
+using k8s.Autorest;
 using k8s.Models;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -108,5 +111,55 @@ public class ResourceInformerTests
         await registration.ReadyAsync(cancellation.Token);
 
         Assert.Equal(shouldBe, deployments.Keys);
+    }
+
+    [Fact]
+    public async Task RunAsyncCanBeCalledAgainAfterStartWatchingWithoutSecondStartSignal()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var informer = new ThrowingResourceInformer();
+
+        informer.StartWatching();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => informer.RunAsync(cancellation.Token));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => informer.RunAsync(cancellation.Token));
+
+        Assert.Equal(2, informer.RetrieveCalls);
+    }
+
+    private sealed class ThrowingResourceInformer : ResourceInformer<V1Pod>
+    {
+        public ThrowingResourceInformer()
+            : base(Mock.Of<IKubernetes>(), new TestHostApplicationLifetime(), NullLogger<ResourceInformer<V1Pod>>.Instance)
+        {
+        }
+
+        public int RetrieveCalls { get; private set; }
+
+        protected override Task<HttpOperationResponse<KubernetesList<V1Pod>>> RetrieveResourceListAsync(
+            bool? watch = null,
+            string? continueParameter = null,
+            string? resourceVersion = null,
+            ResourceSelector<V1Pod>? resourceSelector = null,
+            int? limit = null,
+            CancellationToken cancellationToken = default)
+        {
+            RetrieveCalls++;
+
+            throw new InvalidOperationException("Test failure.");
+        }
+    }
+
+    private sealed class TestHostApplicationLifetime : IHostApplicationLifetime
+    {
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+
+        public CancellationToken ApplicationStopping => CancellationToken.None;
+
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+
+        public void StopApplication()
+        {
+        }
     }
 }

@@ -33,6 +33,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
     private string? _lastResourceVersion;
     private readonly string? _namespace;
+    private bool _startedWatching;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ResourceInformer{TResource}" /> class.
@@ -92,7 +93,16 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
     public void StartWatching()
     {
-        _start.Release();
+        lock (_sync)
+        {
+            if (_startedWatching)
+            {
+                return;
+            }
+
+            _startedWatching = true;
+            _start.Release();
+        }
     }
 
     public virtual IResourceInformerRegistration Register(ResourceInformerCallback<TResource> callback)
@@ -125,11 +135,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     {
         try
         {
-            // Only wait for ready the first time
-            if (_start.CurrentCount == 1)
-            {
-                await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
+            await WaitForStartAsync(cancellationToken).ConfigureAwait(false);
 
             var limiter = new Limiter(new Limit(0.2), 3);
             var shouldSync = true;
@@ -195,6 +201,22 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                 typeof(TResource).Name);
             throw;
         }
+    }
+
+    private async Task WaitForStartAsync(CancellationToken cancellationToken)
+    {
+        lock (_sync)
+        {
+            if (_startedWatching)
+            {
+                return;
+            }
+        }
+
+        await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        // Preserve StartWatching as a one-way signal for any concurrent waiters.
+        _start.Release();
     }
 
     /// <summary>
