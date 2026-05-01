@@ -55,7 +55,7 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
         where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
         where TService : IResourceInformer<TResource>
     {
-        if (string.IsNullOrEmpty(fieldSelector))
+        if (!string.IsNullOrEmpty(fieldSelector))
         {
             services.AddSingleton(new ResourceSelector<TResource>(fieldSelector));
         }
