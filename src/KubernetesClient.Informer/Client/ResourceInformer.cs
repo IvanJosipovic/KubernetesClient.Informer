@@ -10,6 +10,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using KubernetesClient.Informer.Hosting;
 using KubernetesClient.Informer.Rate;
+using System.ComponentModel;
 
 namespace KubernetesClient.Informer.Client;
 
@@ -21,7 +22,7 @@ namespace KubernetesClient.Informer.Client;
 /// <typeparam name="TResource">The type of the t resource.</typeparam>
 /// <seealso cref="IResourceInformer{TResource}" />
 /// <seealso cref="IDisposable" />
-public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInformer<TResource>
+public partial class ResourceInformer<TResource> : BackgroundHostedService, INotifyPropertyChanged, IResourceInformer<TResource>
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
     private readonly object _sync = new();
@@ -33,21 +34,46 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
     private string? _lastResourceVersion;
     private readonly string? _namespace;
+    private ResourceInformerStatus _status = ResourceInformerStatus.NotStarted;
+    private int? _timeoutSeconds;
+
+    /// <summary>
+    /// Occurs when a property value changes.
+    /// </summary>
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    /// <inheritdoc/>
+    public ResourceInformerStatus Status
+    {
+        get => _status;
+        private set
+        {
+            if (_status == value)
+            {
+                return;
+            }
+
+            _status = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status)));
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ResourceInformer{TResource}" /> class.
     /// </summary>
     /// <param name="client">The client.</param>
-    /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
     /// <param name="hostApplicationLifetime">The host application lifetime.</param>
     /// <param name="logger">The logger.</param>
+    /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
     /// <param name="@namespace">The Namespace to scope the informer.</param>
+    /// <param name="timeoutSeconds">The timeout in seconds for list and watch operations.</param>
     public ResourceInformer(
         IKubernetes client,
         IHostApplicationLifetime hostApplicationLifetime,
         ILogger<ResourceInformer<TResource>> logger,
         ResourceSelector<TResource>? selector = null,
-        string? @namespace = null)
+        string? @namespace = null,
+        int? timeoutSeconds = null)
         : base(hostApplicationLifetime, logger)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -56,6 +82,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         _selector = selector;
         _namespace = @namespace;
         _names = GroupApiVersionKind.From<TResource>();
+        _timeoutSeconds = timeoutSeconds;
     }
 
     private enum EventType
@@ -64,10 +91,12 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         SynchronizeComplete = 102,
         WatchingResource = 103,
         ReceivedError = 104,
-        WatchingComplete = 105,
+        WatchingStopped = 105,
         InformerWatchEvent = 106,
         DisposingToReconnect = 107,
         IgnoringError = 108,
+        WatchingFailed = 109,
+        WatchingRetryScheduled = 110,
     }
 
     protected IKubernetes Client { get; init; }
@@ -90,16 +119,20 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         base.Dispose(disposing);
     }
 
+    /// <inheritdoc/>
     public void StartWatching()
     {
+        Status = ResourceInformerStatus.Starting;
         _start.Release();
     }
 
+    /// <inheritdoc/>
     public virtual IResourceInformerRegistration Register(ResourceInformerCallback<TResource> callback)
     {
         return new Registration(this, callback);
     }
 
+    /// <inheritdoc/>
     public IResourceInformerRegistration Register(ResourceInformerCallback<IKubernetesObject<V1ObjectMeta>> callback)
     {
         return new Registration(this, (eventType, resource) => callback(eventType, resource));
@@ -115,151 +148,163 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         _ready.Release();
     }
 
-    /// <summary>
-    /// RunAsync starts processing when StartAsync is called, and is terminated when
-    /// StopAsync is called.
-    /// </summary>
-    /// <param name="cancellationToken">The cancellation token that can be used by other objects or threads to receive notice of cancellation.</param>
-    /// <returns>A <see cref="Task"/> representing the result of the asynchronous operation.</returns>
+    /// <inheritdoc/>
     public override async Task RunAsync(CancellationToken cancellationToken)
     {
+        Status = ResourceInformerStatus.Starting;
+
         try
         {
-            // Only wait for ready the first time
-            if (_start.CurrentCount == 1)
-            {
-                await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
+            await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
 
-            var limiter = new Limiter(new Limit(0.2), 3);
-            var shouldSync = true;
-            var firstSync = true;
-
-            while (true)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                try
-                {
-                    if (shouldSync)
-                    {
-                        await ListAsync(cancellationToken).ConfigureAwait(true);
-                        shouldSync = false;
-                    }
-
-                    if (firstSync)
-                    {
-                        _ready.Release();
-                        firstSync = false;
-                    }
-
-                    await WatchAsync(cancellationToken).ConfigureAwait(true);
-                }
-                catch (IOException ex) when (ex.InnerException is SocketException)
-                {
-                    Logger.LogDebug(
-                        EventId(EventType.ReceivedError),
-                        "Received error watching {ResourceType}: {ErrorMessage}",
-                        typeof(TResource).Name,
-                        ex.Message);
-                }
-                catch (KubernetesException ex)
-                {
-                    Logger.LogDebug(
-                        EventId(EventType.ReceivedError),
-                        "Received error watching {ResourceType}: {ErrorMessage}",
-                        typeof(TResource).Name,
-                        ex.Message);
-
-                    // deal with this non-recoverable condition "too old resource version"
-                    // with a re-sync to listing everything again ensuring no subscribers miss updates
-                    if (ex is KubernetesException kubernetesError)
-                    {
-                        if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
-                        {
-                            shouldSync = true;
-                        }
-                    }
-                }
-
-                // rate limiting the reconnect loop
-                await limiter.WaitAsync(cancellationToken).ConfigureAwait(true);
-            }
+            await RunListWatchAsync(cancellationToken).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Status = ResourceInformerStatus.Stopped;
+            Logger.LogInformation(
+                EventId(EventType.WatchingStopped),
+                "Stopped watching {ResourceType} resources from API server.",
+                typeof(TResource).Name);
+            throw;
         }
         catch (Exception error)
         {
-            Logger.LogInformation(
-                EventId(EventType.WatchingComplete),
+            Status = ResourceInformerStatus.Faulted;
+            Logger.LogError(
+                EventId(EventType.WatchingFailed),
                 error,
-                "No longer watching {ResourceType} resources from API server.",
+                "Failed while watching {ResourceType} resources from API server.",
                 typeof(TResource).Name);
             throw;
         }
     }
 
-    /// <summary>
-    /// Runs the Informer in a while loop until cancellation requested
-    /// </summary>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
+    /// <inheritdoc/>
     public async Task RunInfinite(CancellationToken cancellationToken)
     {
-        while (true)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await RunAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                {
+                    Status = ResourceInformerStatus.Retrying;
 
-            try
-            {
-                await RunAsync(cancellationToken);
+                    Logger.LogWarning(
+                        EventId(EventType.WatchingRetryScheduled),
+                        "Retrying {ResourceType} in 10s",
+                        typeof(TResource).Name);
+
+                    await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+                }
             }
-            catch (Exception)
-            {
-                // rate limiting the reconnect loop
-                Logger.LogInformation(
-                    EventId(EventType.WatchingComplete),
-                    "Retrying {ResourceType} in 10s",
-                    typeof(TResource).Name);
-                await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
-            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            Status = ResourceInformerStatus.Stopped;
         }
     }
 
-    protected virtual async Task<HttpOperationResponse<KubernetesList<TResource>>> RetrieveResourceListAsync(bool? watch = null, string? continueParameter = null, string? resourceVersion = null, ResourceSelector<TResource>? resourceSelector = null, int? limit = null, CancellationToken cancellationToken = default)
+    private async Task RunListWatchAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrEmpty(_namespace))
-        {
-            var listWithHttpMessage = await Client.CustomObjects.ListClusterCustomObjectWithHttpMessagesAsync<KubernetesList<TResource>>(
-            _names.Group,
-            _names.ApiVersion,
-            _names.PluralName,
-            continueParameter: continueParameter,
-            fieldSelector: resourceSelector?.FieldSelector,
-            watch: watch,
-            limit: limit,
-            resourceVersion: resourceVersion,
-            cancellationToken: cancellationToken);
+        var limiter = new Limiter(new Limit(0.2), 3);
+        var shouldSync = true;
+        var firstSync = true;
 
-            return listWithHttpMessage;
-        }
-        else
+        while (!cancellationToken.IsCancellationRequested)
         {
-            var listWithHttpMessage = await Client.CustomObjects.ListNamespacedCustomObjectWithHttpMessagesAsync<KubernetesList<TResource>>(
-            _names.Group,
-            _names.ApiVersion,
-            _namespace,
-            _names.PluralName,
-            continueParameter: continueParameter,
-            fieldSelector: resourceSelector?.FieldSelector,
-            watch: watch,
-            limit: limit,
-            resourceVersion: resourceVersion,
-            cancellationToken: cancellationToken);
+            try
+            {
+                if (shouldSync)
+                {
+                    await ListAsync(cancellationToken).ConfigureAwait(true);
+                    shouldSync = false;
+                }
 
-            return listWithHttpMessage;
+                if (firstSync)
+                {
+                    _ready.Release();
+                    firstSync = false;
+                }
+
+                Status = ResourceInformerStatus.Running;
+                await WatchAsync(cancellationToken).ConfigureAwait(true);
+            }
+            catch (IOException ex) when (ex.InnerException is SocketException)
+            {
+                LogWatchError(ex);
+            }
+            catch (KubernetesException ex)
+            {
+                LogWatchError(ex);
+
+                // Resource version expiry requires a full re-sync so no updates are missed.
+                if (IsExpiredResourceVersion(ex))
+                {
+                    shouldSync = true;
+                }
+            }
+
+            // rate limiting the reconnect loop
+            await limiter.WaitAsync(cancellationToken).ConfigureAwait(true);
         }
     }
 
     private static EventId EventId(EventType eventType) => new EventId((int)eventType, eventType.ToString());
+
+    private void LogWatchError(Exception error)
+    {
+        Logger.LogDebug(
+            EventId(EventType.ReceivedError),
+            "Received error watching {ResourceType}: {ErrorMessage}",
+            typeof(TResource).Name,
+            error.Message);
+    }
+
+    private static bool IsExpiredResourceVersion(KubernetesException exception)
+        => string.Equals(exception.Status?.Reason, "Expired", StringComparison.Ordinal);
+
+    private Task<HttpOperationResponse<TResponse>> CreateResponseAsync<TResponse>(bool? watch, int? limit, bool? allowWatchBookmarks, string? continueParameter, string? resourceVersion, CancellationToken cancellationToken)
+        where TResponse : class
+    {
+        if (string.IsNullOrEmpty(_namespace))
+        {
+            return Client.CustomObjects.ListClusterCustomObjectWithHttpMessagesAsync<TResponse>(
+                _names.Group,
+                _names.ApiVersion,
+                _names.PluralName,
+                allowWatchBookmarks: allowWatchBookmarks,
+                continueParameter: continueParameter,
+                fieldSelector: _selector?.FieldSelector,
+                watch: watch,
+                limit: limit,
+                resourceVersion: resourceVersion,
+                timeoutSeconds: _timeoutSeconds,
+                cancellationToken: cancellationToken);
+        }
+
+        return Client.CustomObjects.ListNamespacedCustomObjectWithHttpMessagesAsync<TResponse>(
+            _names.Group,
+            _names.ApiVersion,
+            _namespace,
+            _names.PluralName,
+            allowWatchBookmarks: allowWatchBookmarks,
+            continueParameter: continueParameter,
+            fieldSelector: _selector?.FieldSelector,
+            watch: watch,
+            limit: limit,
+            resourceVersion: resourceVersion,
+            timeoutSeconds: _timeoutSeconds,
+            cancellationToken: cancellationToken);
+    }
 
     private async Task ListAsync(CancellationToken cancellationToken)
     {
@@ -283,12 +328,19 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         }
 
         string? continueParameter = null;
+
         do
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             // request next page of items
-            using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: 1000, cancellationToken: cancellationToken);
+            using var listWithHttpMessage = await CreateResponseAsync<KubernetesList<TResource>>(
+                watch: null,
+                limit: 1000,
+                allowWatchBookmarks: null,
+                continueParameter: continueParameter,
+                resourceVersion: null,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             var list = listWithHttpMessage.Body;
             foreach (var item in list.Items)
@@ -344,99 +396,62 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
     private async Task WatchAsync(CancellationToken cancellationToken)
     {
-        Logger.LogInformation(
-            EventId(EventType.WatchingResource),
-            "Watching {ResourceType} starting from resource version {ResourceVersion}.",
-            typeof(TResource).Name,
-            _lastResourceVersion);
-
-        // completion source helps turn OnClose callback into something awaitable
-        var watcherCompletionSource = new TaskCompletionSource<int>();
-
-        // begin watching where list left off
-        var watchWithHttpMessage = RetrieveResourceListAsync(watch: true, resourceVersion: _lastResourceVersion, resourceSelector: _selector, cancellationToken: cancellationToken);
+        Logger.LogInformation(EventId(EventType.WatchingResource), "Watching {ResourceType} starting from resource version {ResourceVersion}.", typeof(TResource).Name, _lastResourceVersion);
 
         var lastEventUtc = DateTime.UtcNow;
+        using var reconnectCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var checkLastEventUtcTimer = new Timer(_ =>
+        {
+            var lastEvent = DateTime.UtcNow - lastEventUtc;
+            if (lastEvent > TimeSpan.FromMinutes(9.5))
+            {
+                lastEventUtc = DateTime.MaxValue;
+                Logger.LogDebug(EventId(EventType.DisposingToReconnect), "Disposing watcher for {ResourceType} to cause reconnect.", typeof(TResource).Name);
+                reconnectCancellationTokenSource.Cancel();
+            }
+        }, state: null, dueTime: TimeSpan.FromSeconds(45), period: TimeSpan.FromSeconds(45));
+
+        var watchWithHttpMessage = CreateResponseAsync<TResource>(
+            watch: true,
+            limit: null,
+            allowWatchBookmarks: true,
+            continueParameter: null,
+            resourceVersion: _lastResourceVersion,
+            cancellationToken: reconnectCancellationTokenSource.Token);
+
 #pragma warning disable CS0618 // Type or member is obsolete
-        using var watcher = watchWithHttpMessage.Watch<TResource, KubernetesList<TResource>>(
-            (watchEventType, item) =>
-            {
-                if (!watcherCompletionSource.Task.IsCompleted)
-                {
-                    lastEventUtc = DateTime.UtcNow;
-                    OnEvent(watchEventType, item);
-                }
-            },
-            error =>
-            {
-                if (error is KubernetesException kubernetesError)
-                {
-                    // deal with this non-recoverable condition "too old resource version"
-                    if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
-                    {
-                        // cause this error to surface
-                        watcherCompletionSource.TrySetException(error);
-                        throw error;
-                    }
-                }
-
-                Logger.LogDebug(
-                    EventId(EventType.IgnoringError),
-                    "Ignoring error {ErrorType}: {ErrorMessage}",
-                    error.GetType().Name,
-                    error.Message);
-            },
-            () =>
-            {
-                watcherCompletionSource.TrySetResult(0);
-            });
-#pragma warning restore CS0618 // Type or member is obsolete
-
-        // reconnect if no events have arrived after a certain time
-        using var checkLastEventUtcTimer = new Timer(
-            _ =>
-            {
-                var lastEvent = DateTime.UtcNow - lastEventUtc;
-                if (lastEvent > TimeSpan.FromMinutes(9.5))
-                {
-                    lastEventUtc = DateTime.MaxValue;
-                    Logger.LogDebug(
-                        EventId(EventType.DisposingToReconnect),
-                        "Disposing watcher for {ResourceType} to cause reconnect.",
-                        typeof(TResource).Name);
-
-                    watcherCompletionSource.TrySetCanceled();
-                    watcher.Dispose();
-                }
-            },
-            state: null,
-            dueTime: TimeSpan.FromSeconds(45),
-            period: TimeSpan.FromSeconds(45));
-
-        using var registration = cancellationToken.Register(watcher.Dispose);
         try
         {
-            await watcherCompletionSource.Task;
+            await foreach (var (eventType, resource) in watchWithHttpMessage.WatchAsync<TResource, TResource>((e) =>
+#pragma warning restore CS0618 // Type or member is obsolete
+            {
+                Logger.LogError(
+                    EventId(EventType.ReceivedError),
+                    e,
+                    "Received error while watching {ResourceType} resources from API server.",
+                    typeof(TResource).Name);
+            }, reconnectCancellationTokenSource.Token))
+            {
+                lastEventUtc = DateTime.UtcNow;
+                OnEvent(eventType, resource);
+            }
         }
-        catch (TaskCanceledException)
+        catch (OperationCanceledException) when (reconnectCancellationTokenSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
         }
     }
 
     private void OnEvent(WatchEventType watchEventType, TResource item)
     {
-        if (watchEventType != WatchEventType.Modified || item.Kind != "ConfigMap")
-        {
-            Logger.LogDebug(
-                EventId(EventType.InformerWatchEvent),
-                "Informer {ResourceType} received {WatchEventType} notification for {ItemKind}/{ItemName}.{ItemNamespace} at resource version {ResourceVersion}",
-                typeof(TResource).Name,
-                watchEventType,
-                item.Kind,
-                item.Name(),
-                item.Namespace(),
-                item.ResourceVersion());
-        }
+        Logger.LogDebug(
+            EventId(EventType.InformerWatchEvent),
+            "Informer {ResourceType} received {WatchEventType} notification for {ItemKind}/{ItemName}.{ItemNamespace} at resource version {ResourceVersion}",
+            typeof(TResource).Name,
+            watchEventType,
+            item.Kind,
+            item.Name(),
+            item.Namespace(),
+            item.ResourceVersion());
 
         if (watchEventType == WatchEventType.Added ||
             watchEventType == WatchEventType.Modified)
@@ -486,51 +501,6 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         if (innerExceptions is not null)
         {
             throw new AggregateException("One or more exceptions thrown by ResourceInformerCallback.", innerExceptions);
-        }
-    }
-
-    internal class Registration : IResourceInformerRegistration
-    {
-        private bool _disposedValue;
-
-        public Registration(ResourceInformer<TResource> resourceInformer, ResourceInformerCallback<TResource> callback)
-        {
-            ResourceInformer = resourceInformer;
-            Callback = callback;
-            lock (resourceInformer._sync)
-            {
-                resourceInformer._registrations = resourceInformer._registrations.Add(this);
-            }
-        }
-
-        ~Registration()
-        {
-            // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
-            Dispose(disposing: false);
-        }
-
-        public ResourceInformer<TResource> ResourceInformer { get; }
-        public ResourceInformerCallback<TResource> Callback { get; }
-
-        public Task ReadyAsync(CancellationToken cancellationToken) => ResourceInformer.ReadyAsync(cancellationToken);
-
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposedValue)
-            {
-                lock (ResourceInformer._sync)
-                {
-                    ResourceInformer._registrations = ResourceInformer._registrations.Remove(this);
-                }
-                _disposedValue = true;
-            }
-        }
-
-        public void Dispose()
-        {
-            // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
-            Dispose(disposing: true);
-            GC.SuppressFinalize(this);
         }
     }
 }

@@ -33,7 +33,7 @@ public class TestClusterHost : ITestClusterHost
 
     public Task StartAsync(CancellationToken cancellationToken = default) => _host.StartAsync(cancellationToken);
 
-    public Task StopAsync(CancellationToken cancellationToken = default) => _host.StartAsync(cancellationToken);
+    public Task StopAsync(CancellationToken cancellationToken = default) => _host.StopAsync(cancellationToken);
 
     protected virtual void Dispose(bool disposing)
     {

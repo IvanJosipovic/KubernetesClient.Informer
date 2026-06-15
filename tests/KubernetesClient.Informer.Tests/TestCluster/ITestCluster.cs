@@ -12,4 +12,10 @@ public interface ITestCluster
     Task UnhandledRequest(HttpContext context);
 
     Task<ListResult> ListResourcesAsync(string group, string version, string plural, ListParameters parameters);
+
+    ListParameters? LastListParameters { get; }
+
+    Task<ListParameters> ListRequested { get; }
+
+    Task<ListParameters> WatchRequested { get; }
 }

@@ -5,6 +5,7 @@ using k8s;
 using k8s.Models;
 using Microsoft.Extensions.Hosting;
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -39,11 +40,22 @@ public interface IResourceInformer<TResource> : IHostedService, IResourceInforme
     /// <param name="callback">The delegate that is invoked with each resource notification.</param>
     /// <returns>A registration that should be disposed to end the notifications.</returns>
     IResourceInformerRegistration Register(ResourceInformerCallback<TResource> callback);
+
+    /// <summary>
+    /// Runs the informer indefinitely until the provided cancellation token is cancelled. This method is intended to be used in scenarios where the informer needs to be run outside of a hosted service context, such as in a console application or as part of a long-running process. The method will block until the cancellation token is triggered, at which point it will gracefully shut down the informer and release any resources it holds.
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token that can be used to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     Task RunInfinite(CancellationToken cancellationToken);
 }
 
 public interface IResourceInformer
 {
+    /// <summary>
+    /// Gets the current lifecycle state of the informer.
+    /// </summary>
+    ResourceInformerStatus Status { get; }
+
     /// <summary>
     /// Instructs the resource informer to being watching resources. Allows the startup of informers to be synchronised.
     /// </summary>
