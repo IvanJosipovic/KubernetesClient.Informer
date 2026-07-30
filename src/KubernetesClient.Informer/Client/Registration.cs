@@ -18,6 +18,7 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
             Callback = callback;
             lock (resourceInformer._sync)
             {
+                ObjectDisposedException.ThrowIf(resourceInformer._disposed, resourceInformer);
                 resourceInformer._registrations = resourceInformer._registrations.Add(this);
             }
         }

@@ -21,6 +21,10 @@ public class TestCluster : ITestCluster
 
     public ListParameters? LastListParameters { get; private set; }
 
+    public IList<ListParameters> ListRequests { get; } = new List<ListParameters>();
+
+    public IList<ListParameters> WatchRequests { get; } = new List<ListParameters>();
+
     public Task<ListParameters> ListRequested => _listRequested.Task;
 
     public Task<ListParameters> WatchRequested => _watchRequested.Task;
@@ -51,10 +55,12 @@ public class TestCluster : ITestCluster
         LastListParameters = parameters;
         if (parameters.Watch == true)
         {
+            WatchRequests.Add(parameters);
             _watchRequested.TrySetResult(parameters);
         }
         else
         {
+            ListRequests.Add(parameters);
             _listRequested.TrySetResult(parameters);
         }
 

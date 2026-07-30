@@ -39,6 +39,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private ResourceInformerStatus _status = ResourceInformerStatus.NotStarted;
     private int? _timeoutSeconds;
     private readonly int _resourceListLimit;
+    private bool _disposed;
 
     /// <summary>
     /// Occurs when a property value changes.
@@ -111,12 +112,31 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
+        if (disposing)
+        {
+            lock (_sync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+                _registrations = [];
+            }
+
+            _ready.Dispose();
+            _start.Dispose();
+        }
+
         base.Dispose(disposing);
     }
 
     /// <inheritdoc/>
     public void StartWatching()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         Status = ResourceInformerStatus.Starting;
         if (Interlocked.Exchange(ref _startSignaled, 1) == 0)
         {
@@ -127,12 +147,18 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <inheritdoc/>
     public virtual IResourceInformerRegistration Register(ResourceInformerCallback<TResource> callback)
     {
+        ArgumentNullException.ThrowIfNull(callback);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         return new Registration(this, callback);
     }
 
     /// <inheritdoc/>
     public IResourceInformerRegistration Register(ResourceInformerCallback<IKubernetesObject<V1ObjectMeta>> callback)
     {
+        ArgumentNullException.ThrowIfNull(callback);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         return new Registration(this, (eventType, resource) => callback(eventType, resource));
     }
 
@@ -326,7 +352,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private async Task ListAsync(CancellationToken cancellationToken)
     {
         var previousCache = _cache;
-        _cache = [];
+        var nextCache = new Dictionary<NamespacedName, IList<V1OwnerReference>>();
+        var listedItems = new List<(WatchEventType EventType, TResource Resource)>();
+        string? nextResourceVersion = null;
 
         if (_selector?.FieldSelector is not null)
         {
@@ -368,26 +396,39 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 item.Kind = _names.Kind;
 
                 var key = NamespacedName.From(item);
-                _cache[key] = item?.Metadata?.OwnerReferences;
+                nextCache[key] = item?.Metadata?.OwnerReferences;
 
                 var watchEventType = WatchEventType.Added;
-                if (previousCache.Remove(key))
+                if (previousCache.ContainsKey(key))
                 {
                     // an already-known key is provided as a modification for re-sync purposes
                     watchEventType = WatchEventType.Modified;
                 }
 
-                InvokeRegistrationCallbacks(watchEventType, item);
+                listedItems.Add((watchEventType, item));
             }
 
             // keep track of values needed for next page and to start watching
-            _lastResourceVersion = list.ResourceVersion();
+            nextResourceVersion = list.ResourceVersion();
             continueParameter = list.Continue();
         }
         while (!string.IsNullOrEmpty(continueParameter));
 
+        _cache = nextCache;
+        _lastResourceVersion = nextResourceVersion;
+
+        foreach (var (eventType, resource) in listedItems)
+        {
+            InvokeRegistrationCallbacks(eventType, resource);
+        }
+
         foreach (var (key, value) in previousCache)
         {
+            if (nextCache.ContainsKey(key))
+            {
+                continue;
+            }
+
             // for anything which was previously known but not part of list
             // send a deleted notification to clear any observer caches
             var item = new TResource()
@@ -506,8 +547,19 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private void InvokeRegistrationCallbacks(WatchEventType eventType, TResource resource)
     {
         List<Exception>? innerExceptions = default;
+        ImmutableList<Registration> registrations;
 
-        foreach (var registration in _registrations)
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            registrations = _registrations;
+        }
+
+        foreach (var registration in registrations)
         {
             try
             {

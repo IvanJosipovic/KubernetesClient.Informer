@@ -281,6 +281,88 @@ public class ResourceInformerTests
     }
 
     [Fact]
+    public async Task FailedRelistDoesNotPublishPartialResults()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        var listRequestCount = 0;
+
+        customObjects
+            .Setup(x => x.ListClusterCustomObjectWithHttpMessagesAsync<KubernetesList<V1Pod>>(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<bool?>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<int?>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<int?>(),
+                It.IsAny<bool?>(),
+                It.IsAny<bool?>(),
+                It.IsAny<IReadOnlyDictionary<string, IReadOnlyList<string>>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref listRequestCount) == 1)
+                {
+                    return Task.FromResult(new HttpOperationResponse<KubernetesList<V1Pod>>
+                    {
+                        Body = new KubernetesList<V1Pod>(
+                            [new V1Pod { Metadata = new V1ObjectMeta { Name = "committed" } }],
+                            "v1",
+                            V1PodList.KubeKind,
+                            new V1ListMeta { ContinueProperty = "next", ResourceVersion = "1" }),
+                    });
+                }
+
+                throw new InvalidOperationException("The second list page failed.");
+            });
+
+        customObjects
+            .Setup(x => x.ListClusterCustomObjectWithHttpMessagesAsync<V1Pod>(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<bool?>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<int?>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<int?>(),
+                It.Is<bool?>(watch => watch == true),
+                It.IsAny<bool?>(),
+                It.IsAny<IReadOnlyDictionary<string, IReadOnlyList<string>>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback(() => cancellation.Cancel())
+            .ThrowsAsync(new HttpRequestException("Stop test watch."));
+
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(x => x.CustomObjects).Returns(customObjects.Object);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            resourceListLimit: 1);
+        var events = new List<(WatchEventType Type, string Name)>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            events.Add((eventType, pod.Name()))));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await Assert.ThrowsAnyAsync<InvalidOperationException>(() => runTask);
+
+        Assert.Empty(events);
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
+    }
+
+    [Fact]
     public async Task NamespacedInformerUsesNamespacedListEndpoint()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));

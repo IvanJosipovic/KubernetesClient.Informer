@@ -16,6 +16,10 @@ public interface ITestCluster
 
     ListParameters? LastListParameters { get; }
 
+    IList<ListParameters> ListRequests { get; }
+
+    IList<ListParameters> WatchRequests { get; }
+
     Task<ListParameters> ListRequested { get; }
 
     Task<ListParameters> WatchRequested { get; }
