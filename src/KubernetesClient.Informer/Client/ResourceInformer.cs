@@ -33,28 +33,33 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
     private string? _lastResourceVersion;
     private readonly string? _namespace;
+    private readonly int _resourceListLimit;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ResourceInformer{TResource}" /> class.
     /// </summary>
     /// <param name="client">The client.</param>
-    /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
     /// <param name="hostApplicationLifetime">The host application lifetime.</param>
     /// <param name="logger">The logger.</param>
-    /// <param name="@namespace">The Namespace to scope the informer.</param>
+    /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
+    /// <param name="namespace">The Namespace to scope the informer.</param>
+    /// <param name="resourceListLimit">The maximum number of resources to request in each list page.</param>
     public ResourceInformer(
         IKubernetes client,
         IHostApplicationLifetime hostApplicationLifetime,
         ILogger<ResourceInformer<TResource>> logger,
         ResourceSelector<TResource>? selector = null,
-        string? @namespace = null)
+        string? @namespace = null,
+        int resourceListLimit = 1000)
         : base(hostApplicationLifetime, logger)
     {
         ArgumentNullException.ThrowIfNull(client);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(resourceListLimit);
 
         Client = client;
         _selector = selector;
         _namespace = @namespace;
+        _resourceListLimit = resourceListLimit;
         _names = GroupApiVersionKind.From<TResource>();
     }
 
@@ -288,7 +293,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
             cancellationToken.ThrowIfCancellationRequested();
 
             // request next page of items
-            using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: 1000, cancellationToken: cancellationToken);
+            using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: _resourceListLimit, cancellationToken: cancellationToken);
 
             var list = listWithHttpMessage.Body;
             foreach (var item in list.Items)
