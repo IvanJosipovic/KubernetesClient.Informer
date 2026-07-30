@@ -29,6 +29,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private readonly GroupApiVersionKind _names;
     private readonly SemaphoreSlim _ready = new(0);
     private readonly SemaphoreSlim _start = new(0);
+    private int _startWaited;
     private readonly ResourceSelector<TResource>? _selector;
     private ImmutableList<Registration> _registrations = [];
     private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
@@ -36,6 +37,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private readonly string? _namespace;
     private ResourceInformerStatus _status = ResourceInformerStatus.NotStarted;
     private int? _timeoutSeconds;
+    private readonly int _resourceListLimit;
 
     /// <summary>
     /// Occurs when a property value changes.
@@ -65,24 +67,28 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <param name="hostApplicationLifetime">The host application lifetime.</param>
     /// <param name="logger">The logger.</param>
     /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
-    /// <param name="@namespace">The Namespace to scope the informer.</param>
+    /// <param name="namespace">The Namespace to scope the informer.</param>
     /// <param name="timeoutSeconds">The timeout in seconds for list and watch operations.</param>
+    /// <param name="resourceListLimit">The maximum number of resources to request in each list page.</param>
     public ResourceInformer(
         IKubernetes client,
         IHostApplicationLifetime hostApplicationLifetime,
         ILogger<ResourceInformer<TResource>> logger,
         ResourceSelector<TResource>? selector = null,
         string? @namespace = null,
-        int? timeoutSeconds = null)
+        int? timeoutSeconds = null,
+        int resourceListLimit = 1000)
         : base(hostApplicationLifetime, logger)
     {
         ArgumentNullException.ThrowIfNull(client);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(resourceListLimit);
 
         Client = client;
         _selector = selector;
         _namespace = @namespace;
         _names = GroupApiVersionKind.From<TResource>();
         _timeoutSeconds = timeoutSeconds;
+        _resourceListLimit = resourceListLimit;
     }
 
     private enum EventType
@@ -155,7 +161,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         try
         {
-            await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
+            // Wait only for the first RunAsync invocation; retries should continue immediately.
+            if (Interlocked.Exchange(ref _startWaited, 1) == 0)
+            {
+                await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
 
             await RunListWatchAsync(cancellationToken).ConfigureAwait(true);
         }
@@ -242,6 +252,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             {
                 LogWatchError(ex);
             }
+            catch (HttpRequestException ex)
+            {
+                LogWatchError(ex);
+            }
             catch (KubernetesException ex)
             {
                 LogWatchError(ex);
@@ -266,7 +280,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             EventId(EventType.ReceivedError),
             "Received error watching {ResourceType}: {ErrorMessage}",
             typeof(TResource).Name,
-            error.Message);
+            error);
     }
 
     private static bool IsExpiredResourceVersion(KubernetesException exception)
