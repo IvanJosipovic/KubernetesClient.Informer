@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using Microsoft.AspNetCore.Http;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using KubernetesClient.Informer.Tests.TestCluster.Models;
 
@@ -18,4 +19,6 @@ public interface ITestCluster
     Task<ListParameters> ListRequested { get; }
 
     Task<ListParameters> WatchRequested { get; }
+
+    IList<WatchEvent> WatchEvents { get; }
 }

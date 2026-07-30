@@ -25,6 +25,8 @@ public class TestCluster : ITestCluster
 
     public Task<ListParameters> WatchRequested => _watchRequested.Task;
 
+    public IList<WatchEvent> WatchEvents { get; } = new List<WatchEvent>();
+
     public TestCluster(IOptions<TestClusterOptions> options)
     {
         ArgumentNullException.ThrowIfNull(options);

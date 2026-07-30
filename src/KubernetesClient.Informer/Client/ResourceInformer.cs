@@ -30,6 +30,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private readonly SemaphoreSlim _ready = new(0);
     private readonly SemaphoreSlim _start = new(0);
     private int _startWaited;
+    private int _startSignaled;
     private readonly ResourceSelector<TResource>? _selector;
     private ImmutableList<Registration> _registrations = [];
     private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
@@ -110,18 +111,6 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
-        {
-            try
-            {
-                _start.Dispose();
-                _ready.Dispose();
-            }
-            catch (ObjectDisposedException)
-            {
-                // ignore redundant exception to allow shutdown sequence to progress uninterrupted
-            }
-        }
         base.Dispose(disposing);
     }
 
@@ -129,7 +118,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     public void StartWatching()
     {
         Status = ResourceInformerStatus.Starting;
-        _start.Release();
+        if (Interlocked.Exchange(ref _startSignaled, 1) == 0)
+        {
+            _start.Release();
+        }
     }
 
     /// <inheritdoc/>
@@ -193,6 +185,8 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <inheritdoc/>
     public async Task RunInfinite(CancellationToken cancellationToken)
     {
+        StartWatching();
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -201,7 +195,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 {
                     await RunAsync(cancellationToken).ConfigureAwait(false);
                 }
-                catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                catch (Exception error) when (!cancellationToken.IsCancellationRequested && IsRetryable(error))
                 {
                     Status = ResourceInformerStatus.Retrying;
 
@@ -285,6 +279,15 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private static bool IsExpiredResourceVersion(KubernetesException exception)
         => string.Equals(exception.Status?.Reason, "Expired", StringComparison.Ordinal);
+
+    private static bool IsRetryable(Exception exception)
+        => exception switch
+        {
+            HttpRequestException => true,
+            KubernetesException => true,
+            IOException { InnerException: SocketException } => true,
+            _ => false,
+        };
 
     private Task<HttpOperationResponse<TResponse>> CreateResponseAsync<TResponse>(bool? watch, int? limit, bool? allowWatchBookmarks, string? continueParameter, string? resourceVersion, CancellationToken cancellationToken)
         where TResponse : class
@@ -439,6 +442,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             await foreach (var (eventType, resource) in watchWithHttpMessage.WatchAsync<TResource, TResource>((e) =>
 #pragma warning restore CS0618 // Type or member is obsolete
             {
+                if (e is KubernetesException kubernetesException && IsExpiredResourceVersion(kubernetesException))
+                {
+                    throw kubernetesException;
+                }
+
                 Logger.LogError(
                     EventId(EventType.ReceivedError),
                     e,
