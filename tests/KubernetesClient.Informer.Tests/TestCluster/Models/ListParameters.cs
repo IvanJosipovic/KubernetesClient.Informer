@@ -23,10 +23,16 @@ public class ListParameters
     public string ResourceVersion { get; set; }
 
     [FromQuery]
+    public string ResourceVersionMatch { get; set; }
+
+    [FromQuery]
     public int? TimeoutSeconds { get; set; }
 
     [FromQuery]
     public bool? Watch { get; set; }
+
+    [FromQuery]
+    public bool? AllowWatchBookmarks { get; set; }
 
     [FromQuery]
     public string Pretty { get; set; }

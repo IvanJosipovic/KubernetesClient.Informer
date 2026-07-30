@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using Microsoft.AspNetCore.Http;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using KubernetesClient.Informer.Tests.TestCluster.Models;
 
@@ -12,4 +13,16 @@ public interface ITestCluster
     Task UnhandledRequest(HttpContext context);
 
     Task<ListResult> ListResourcesAsync(string group, string version, string plural, ListParameters parameters);
+
+    ListParameters? LastListParameters { get; }
+
+    IList<ListParameters> ListRequests { get; }
+
+    IList<ListParameters> WatchRequests { get; }
+
+    Task<ListParameters> ListRequested { get; }
+
+    Task<ListParameters> WatchRequested { get; }
+
+    IList<WatchEvent> WatchEvents { get; }
 }

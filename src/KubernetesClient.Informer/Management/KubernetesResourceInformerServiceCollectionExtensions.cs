@@ -21,7 +21,6 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
     /// Registers the resource informer.
     /// </summary>
     /// <typeparam name="TResource">The type of the t related resource.</typeparam>
-    /// <typeparam name="TService">The implementation type of the resource informer.</typeparam>
     /// <param name="services">The services.</param>
     /// <returns>IServiceCollection.</returns>
     public static IServiceCollection RegisterResourceInformer<TResource>(this IServiceCollection services)
@@ -29,6 +28,7 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
     {
         return services.RegisterResourceInformer<TResource, ResourceInformer<TResource>>(null);
     }
+
     /// <summary>
     /// Registers the resource informer.
     /// </summary>
@@ -36,7 +36,7 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
     /// <typeparam name="TService">The implementation type of the resource informer.</typeparam>
     /// <param name="services">The services.</param>
     /// <returns>IServiceCollection.</returns>
-    public static IServiceCollection RegisterResourceInformer<TResource, TService>(this IServiceCollection services)
+    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services)
         where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
         where TService : IResourceInformer<TResource>
     {
@@ -51,11 +51,11 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
     /// <param name="services">The services.</param>
     /// <param name="fieldSelector">A field selector to constrain the resources the informer retrieves.</param>
     /// <returns>IServiceCollection.</returns>
-    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services, string fieldSelector)
+    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services, string? fieldSelector)
         where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
         where TService : IResourceInformer<TResource>
     {
-        if (string.IsNullOrEmpty(fieldSelector))
+        if (!string.IsNullOrEmpty(fieldSelector))
         {
             services.AddSingleton(new ResourceSelector<TResource>(fieldSelector));
         }

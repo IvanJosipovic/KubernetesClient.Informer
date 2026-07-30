@@ -16,6 +16,21 @@ public class TestCluster : ITestCluster
 {
     public IList<ResourceObject> Resources { get; } = new List<ResourceObject>();
 
+    private readonly TaskCompletionSource<ListParameters> _listRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<ListParameters> _watchRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public ListParameters? LastListParameters { get; private set; }
+
+    public IList<ListParameters> ListRequests { get; } = new List<ListParameters>();
+
+    public IList<ListParameters> WatchRequests { get; } = new List<ListParameters>();
+
+    public Task<ListParameters> ListRequested => _listRequested.Task;
+
+    public Task<ListParameters> WatchRequested => _watchRequested.Task;
+
+    public IList<WatchEvent> WatchEvents { get; } = new List<WatchEvent>();
+
     public TestCluster(IOptions<TestClusterOptions> options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -36,6 +51,18 @@ public class TestCluster : ITestCluster
         ArgumentException.ThrowIfNullOrEmpty(version);
         ArgumentException.ThrowIfNullOrEmpty(plural);
         ArgumentNullException.ThrowIfNull(parameters);
+
+        LastListParameters = parameters;
+        if (parameters.Watch == true)
+        {
+            WatchRequests.Add(parameters);
+            _watchRequested.TrySetResult(parameters);
+        }
+        else
+        {
+            ListRequests.Add(parameters);
+            _listRequested.TrySetResult(parameters);
+        }
 
         return Task.FromResult(new ListResult
         {
