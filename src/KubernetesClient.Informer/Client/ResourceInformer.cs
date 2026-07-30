@@ -380,30 +380,30 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 InvokeRegistrationCallbacks(watchEventType, item);
             }
 
-            foreach (var (key, value) in previousCache)
-            {
-                // for anything which was previously known but not part of list
-                // send a deleted notification to clear any observer caches
-                var item = new TResource()
-                {
-                    ApiVersion = _names.GroupApiVersion,
-                    Kind = _names.Kind,
-                    Metadata = new V1ObjectMeta()
-                    {
-                        Name = key.Name,
-                        NamespaceProperty = key.Namespace,
-                        OwnerReferences = value
-                    }
-                };
-
-                InvokeRegistrationCallbacks(WatchEventType.Deleted, item);
-            }
-
             // keep track of values needed for next page and to start watching
             _lastResourceVersion = list.ResourceVersion();
             continueParameter = list.Continue();
         }
         while (!string.IsNullOrEmpty(continueParameter));
+
+        foreach (var (key, value) in previousCache)
+        {
+            // for anything which was previously known but not part of list
+            // send a deleted notification to clear any observer caches
+            var item = new TResource()
+            {
+                ApiVersion = _names.GroupApiVersion,
+                Kind = _names.Kind,
+                Metadata = new V1ObjectMeta()
+                {
+                    Name = key.Name,
+                    NamespaceProperty = key.Namespace,
+                    OwnerReferences = value
+                }
+            };
+
+            InvokeRegistrationCallbacks(WatchEventType.Deleted, item);
+        }
 
         Logger.LogInformation(
             EventId(EventType.SynchronizeComplete),

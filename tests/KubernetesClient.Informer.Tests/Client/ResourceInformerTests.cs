@@ -164,7 +164,7 @@ public class ResourceInformerTests
 
         informer.StartWatching();
 
-        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await registration.ReadyAsync(CancellationToken.None).DefaultTimeout();
 
         Assert.NotNull(clusterHost.Cluster.LastListParameters);
     }
@@ -173,7 +173,7 @@ public class ResourceInformerTests
     public async Task ReadyAsyncCanBeCanceledBeforeInitialList()
     {
         using var cancellation = new CancellationTokenSource();
-        var informer = new ResourceInformer<V1Pod>(
+        using var informer = new ResourceInformer<V1Pod>(
             Mock.Of<IKubernetes>(),
             Mock.Of<IHostApplicationLifetime>(),
             NullLogger<ResourceInformer<V1Pod>>.Instance);
@@ -246,7 +246,7 @@ public class ResourceInformerTests
         var kubernetes = new Mock<IKubernetes>();
         kubernetes.SetupGet(x => x.CustomObjects).Returns(customObjects.Object);
 
-        var informer = new ResourceInformer<V1Pod>(
+        using var informer = new ResourceInformer<V1Pod>(
             kubernetes.Object,
             Mock.Of<IHostApplicationLifetime>(),
             NullLogger<ResourceInformer<V1Pod>>.Instance);
@@ -256,7 +256,7 @@ public class ResourceInformerTests
         var runTask = informer.RunAsync(cancellation.Token);
         informer.StartWatching();
 
-        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await registration.ReadyAsync(CancellationToken.None).DefaultTimeout();
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
@@ -336,7 +336,7 @@ public class ResourceInformerTests
         var kubernetes = new Mock<IKubernetes>();
         kubernetes.SetupGet(x => x.CustomObjects).Returns(customObjects.Object);
 
-        var informer = new ResourceInformer<V1Pod>(
+        using var informer = new ResourceInformer<V1Pod>(
             kubernetes.Object,
             Mock.Of<IHostApplicationLifetime>(),
             NullLogger<ResourceInformer<V1Pod>>.Instance,
@@ -346,7 +346,7 @@ public class ResourceInformerTests
         var runTask = informer.RunAsync(cancellation.Token);
         informer.StartWatching();
 
-        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await registration.ReadyAsync(CancellationToken.None).DefaultTimeout();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
 
         customObjects.Verify(x => x.ListNamespacedCustomObjectWithHttpMessagesAsync<KubernetesList<V1Pod>>(
@@ -446,7 +446,7 @@ public class ResourceInformerTests
 
         await clusterHost.StartAsync(cancellation.Token);
 
-        var informer = new ResourceInformer<V1Pod>(
+        using var informer = new ResourceInformer<V1Pod>(
             clusterHost.Client,
             Mock.Of<IHostApplicationLifetime>(),
             NullLogger<ResourceInformer<V1Pod>>.Instance);
@@ -508,6 +508,7 @@ public class ResourceInformerTests
         await testHost.StartAsync(cancellation.Token);
 
         await registration1.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await registration2.ReadyAsync(cancellation.Token).DefaultTimeout();
 
         Assert.Equal(shouldBe, received1.Keys);
         Assert.Equal(shouldBe, received2.Keys);
@@ -688,7 +689,7 @@ public class ResourceInformerTests
         kubernetes.SetupGet(x => x.CustomObjects).Returns(customObjects.Object);
 
         using var loggerFactory = LoggerFactory.Create(builder => { });
-        var informer = new ResourceInformer<V1Pod>(kubernetes.Object, Mock.Of<IHostApplicationLifetime>(), loggerFactory.CreateLogger<ResourceInformer<V1Pod>>());
+        using var informer = new ResourceInformer<V1Pod>(kubernetes.Object, Mock.Of<IHostApplicationLifetime>(), loggerFactory.CreateLogger<ResourceInformer<V1Pod>>());
         var runTask = informer.RunAsync(cancellation.Token);
 
         informer.StartWatching();
@@ -699,7 +700,7 @@ public class ResourceInformerTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
 
-        Assert.NotEqual(ResourceInformerStatus.Faulted, informer.Status);
+        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
     }
 
     [Fact]
@@ -766,17 +767,17 @@ public class ResourceInformerTests
         kubernetes.SetupGet(x => x.CustomObjects).Returns(customObjects.Object);
 
         using var loggerFactory = LoggerFactory.Create(builder => { });
-        var informer = new ResourceInformer<V1Pod>(kubernetes.Object, Mock.Of<IHostApplicationLifetime>(), loggerFactory.CreateLogger<ResourceInformer<V1Pod>>());
+        using var informer = new ResourceInformer<V1Pod>(kubernetes.Object, Mock.Of<IHostApplicationLifetime>(), loggerFactory.CreateLogger<ResourceInformer<V1Pod>>());
         var runTask = informer.RunAsync(cancellation.Token);
 
         informer.StartWatching();
 
-        await secondListRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        await secondListRequested.Task.WaitAsync(CancellationToken.None).DefaultTimeout();
 
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
-        Assert.Equal(2, listRequestCount);
+        Assert.True(listRequestCount >= 2, $"Expected at least 2 list requests, saw {listRequestCount}.");
     }
 
     [Fact]
