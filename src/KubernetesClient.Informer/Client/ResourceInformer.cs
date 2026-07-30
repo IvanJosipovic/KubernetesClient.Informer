@@ -39,10 +39,10 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     /// Initializes a new instance of the <see cref="ResourceInformer{TResource}" /> class.
     /// </summary>
     /// <param name="client">The client.</param>
-    /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
     /// <param name="hostApplicationLifetime">The host application lifetime.</param>
     /// <param name="logger">The logger.</param>
-    /// <param name="@namespace">The Namespace to scope the informer.</param>
+    /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
+    /// <param name="namespace">The Namespace to scope the informer.</param>
     /// <param name="resourceListLimit">The maximum number of resources to request in each list page.</param>
     public ResourceInformer(
         IKubernetes client,
