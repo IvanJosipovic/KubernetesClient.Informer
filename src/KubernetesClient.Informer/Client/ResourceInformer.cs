@@ -350,7 +350,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             // request next page of items
             using var listWithHttpMessage = await CreateResponseAsync<KubernetesList<TResource>>(
                 watch: null,
-                limit: 1000,
+                limit: _resourceListLimit,
                 allowWatchBookmarks: null,
                 continueParameter: continueParameter,
                 resourceVersion: null,
