@@ -90,7 +90,7 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
                 try
                 {
                     // call the overridden method
-                    await RunAsync(_runCancellation.Token).ConfigureAwait(true);
+                    await RunAsync(_runCancellation.Token).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -165,6 +165,7 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
             {
                 try
                 {
+                    _runCancellation.Cancel();
                     _runCancellation.Dispose();
                 }
                 catch (ObjectDisposedException)
