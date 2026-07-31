@@ -27,7 +27,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 {
     private readonly object _sync = new();
     private readonly GroupApiVersionKind _names;
-    private readonly SemaphoreSlim _ready = new(0);
+    private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _start = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ResourceSelector<TResource>? _selector;
     private ImmutableList<Registration> _registrations = [];
@@ -82,18 +82,6 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-
-        if (disposing)
-        {
-            try
-            {
-                _ready.Dispose();
-            }
-            catch (ObjectDisposedException)
-            {
-                // ignore redundant exception to allow shutdown sequence to progress uninterrupted
-            }
-        }
     }
 
     public void StartWatching()
@@ -116,11 +104,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     /// <inheritdoc/>
     public virtual async Task ReadyAsync(CancellationToken cancellationToken)
     {
-        await _ready.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        // Release is called after each WaitAsync because
-        // the semaphore is being used as a manual reset event
-        _ready.Release();
+        await _ready.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -153,7 +137,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
                     if (firstSync)
                     {
-                        _ready.Release();
+                        _ready.TrySetResult();
                         firstSync = false;
                     }
 

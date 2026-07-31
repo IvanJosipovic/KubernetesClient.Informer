@@ -116,13 +116,15 @@ public class ResourceInformerTests
     }
 
     [Fact]
-    public async Task DisposeDisposesSynchronizationPrimitives()
+    public async Task DisposeDoesNotInvalidateReadinessSignal()
     {
         using var informer = CreateInformer();
         informer.Dispose();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
 
-        await Assert.ThrowsAsync<ObjectDisposedException>(
-            () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => informer.ReadyAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
     [Fact]
@@ -219,8 +221,9 @@ public class ResourceInformerTests
 
         public override Task RunAsync(CancellationToken cancellationToken)
         {
+            _runTask = Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             RunStarted.TrySetResult();
-            return _runTask = Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return _runTask;
         }
     }
 
