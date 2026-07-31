@@ -3,6 +3,7 @@
 
 using System.Collections.Immutable;
 using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using k8s;
 using k8s.Autorest;
 using k8s.Models;
@@ -26,8 +27,8 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 {
     private readonly object _sync = new();
     private readonly GroupApiVersionKind _names;
-    private readonly SemaphoreSlim _ready = new(0);
-    private readonly SemaphoreSlim _start = new(0);
+    private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _start = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ResourceSelector<TResource>? _selector;
     private ImmutableList<Registration> _registrations = [];
     private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
@@ -80,44 +81,30 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
-        {
-            try
-            {
-                _start.Dispose();
-                _ready.Dispose();
-            }
-            catch (ObjectDisposedException)
-            {
-                // ignore redundant exception to allow shutdown sequence to progress uninterrupted
-            }
-        }
         base.Dispose(disposing);
     }
 
     public void StartWatching()
     {
-        _start.Release();
+        _start.TrySetResult();
     }
 
     public virtual IResourceInformerRegistration Register(ResourceInformerCallback<TResource> callback)
     {
+        ArgumentNullException.ThrowIfNull(callback);
         return new Registration(this, callback);
     }
 
     public IResourceInformerRegistration Register(ResourceInformerCallback<IKubernetesObject<V1ObjectMeta>> callback)
     {
+        ArgumentNullException.ThrowIfNull(callback);
         return new Registration(this, (eventType, resource) => callback(eventType, resource));
     }
 
     /// <inheritdoc/>
     public virtual async Task ReadyAsync(CancellationToken cancellationToken)
     {
-        await _ready.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        // Release is called after each WaitAsync because
-        // the semaphore is being used as a manual reset event
-        _ready.Release();
+        await _ready.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -130,11 +117,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     {
         try
         {
-            // Only wait for ready the first time
-            if (_start.CurrentCount == 1)
-            {
-                await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
+            await _start.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
 
             var limiter = new Limiter(new Limit(0.2), 3);
             var shouldSync = true;
@@ -148,17 +131,17 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                 {
                     if (shouldSync)
                     {
-                        await ListAsync(cancellationToken).ConfigureAwait(true);
+                        await ListAsync(cancellationToken).ConfigureAwait(false);
                         shouldSync = false;
                     }
 
                     if (firstSync)
                     {
-                        _ready.Release();
+                        _ready.TrySetResult();
                         firstSync = false;
                     }
 
-                    await WatchAsync(cancellationToken).ConfigureAwait(true);
+                    await WatchAsync(cancellationToken).ConfigureAwait(false);
                 }
                 catch (IOException ex) when (ex.InnerException is SocketException)
                 {
@@ -178,18 +161,19 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
                     // deal with this non-recoverable condition "too old resource version"
                     // with a re-sync to listing everything again ensuring no subscribers miss updates
-                    if (ex is KubernetesException kubernetesError)
+                    if (string.Equals(ex.Status.Reason, "Expired", StringComparison.Ordinal))
                     {
-                        if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
-                        {
-                            shouldSync = true;
-                        }
+                        shouldSync = true;
                     }
                 }
 
                 // rate limiting the reconnect loop
-                await limiter.WaitAsync(cancellationToken).ConfigureAwait(true);
+                await limiter.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
+        }
+        catch (OperationCanceledException ex) when (ex.CancellationToken == cancellationToken && cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception error)
         {
@@ -215,7 +199,15 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
             try
             {
-                await RunAsync(cancellationToken);
+                await RunAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException ex) when (ex.CancellationToken == cancellationToken && cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception)
             {
@@ -242,7 +234,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
             watch: watch,
             limit: limit,
             resourceVersion: resourceVersion,
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return listWithHttpMessage;
         }
@@ -258,7 +250,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
             watch: watch,
             limit: limit,
             resourceVersion: resourceVersion,
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return listWithHttpMessage;
         }
@@ -293,11 +285,13 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
             cancellationToken.ThrowIfCancellationRequested();
 
             // request next page of items
-            using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: _resourceListLimit, cancellationToken: cancellationToken);
+            using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: _resourceListLimit, cancellationToken: cancellationToken).ConfigureAwait(false);
 
             var list = listWithHttpMessage.Body;
             foreach (var item in list.Items)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 // These properties are not already set on items while listing
                 // assigned here for consistency
                 item.ApiVersion = _names.GroupApiVersion;
@@ -318,6 +312,8 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
             foreach (var (key, value) in previousCache)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 // for anything which was previously known but not part of list
                 // send a deleted notification to clear any observer caches
                 var item = new TResource()
@@ -356,7 +352,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
             _lastResourceVersion);
 
         // completion source helps turn OnClose callback into something awaitable
-        var watcherCompletionSource = new TaskCompletionSource<int>();
+        var watcherCompletionSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         // begin watching where list left off
         var watchWithHttpMessage = RetrieveResourceListAsync(watch: true, resourceVersion: _lastResourceVersion, resourceSelector: _selector, cancellationToken: cancellationToken);
@@ -381,7 +377,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                     {
                         // cause this error to surface
                         watcherCompletionSource.TrySetException(error);
-                        throw error;
+                        ExceptionDispatchInfo.Capture(error).Throw();
                     }
                 }
 
@@ -421,9 +417,9 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         using var registration = cancellationToken.Register(watcher.Dispose);
         try
         {
-            await watcherCompletionSource.Task;
+            await watcherCompletionSource.Task.ConfigureAwait(false);
         }
-        catch (TaskCanceledException)
+        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
         }
     }
