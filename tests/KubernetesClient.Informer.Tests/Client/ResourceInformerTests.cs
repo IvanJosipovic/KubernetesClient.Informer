@@ -12,6 +12,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -22,6 +23,25 @@ namespace KubernetesClient.Informer.Client.Tests;
 
 public class ResourceInformerTests
 {
+    [Fact]
+    public void ConstructorUsesSpecifiedNamesOrResourceNamesWhenNamesAreNull()
+    {
+        var specifiedNames = new GroupApiVersionKind("custom.example.com", "v1", "CustomResource", "customresources");
+
+        using var informerWithSpecifiedNames = new ResourceInformer<V1Pod>(
+            new Mock<IKubernetes>().Object,
+            new Mock<IHostApplicationLifetime>().Object,
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            groupApiVersionKind: specifiedNames);
+        using var informerWithDefaultNames = CreateInformer();
+
+        var namesField = typeof(ResourceInformer<V1Pod>).GetField("_groupApiVersionKind", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        Assert.NotNull(namesField);
+        Assert.Equal(specifiedNames, namesField.GetValue(informerWithSpecifiedNames));
+        Assert.Equal(GroupApiVersionKind.From<V1Pod>(), namesField.GetValue(informerWithDefaultNames));
+    }
+
     [Fact]
     public async Task RunAsyncThrowsWhenCancellationIsAlreadyRequested()
     {
