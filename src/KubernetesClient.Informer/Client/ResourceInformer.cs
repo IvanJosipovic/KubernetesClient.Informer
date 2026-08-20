@@ -26,7 +26,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
     private readonly object _sync = new();
-    private readonly GroupApiVersionKind _names;
+    private readonly GroupApiVersionKind _groupApiVersionKind;
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _start = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ResourceSelector<TResource>? _selector;
@@ -45,13 +45,15 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
     /// <param name="namespace">The Namespace to scope the informer.</param>
     /// <param name="resourceListLimit">The maximum number of resources to request in each list page.</param>
+    /// <param name="groupApiVersionKind">The resource group, API version, kind, and plural name to use when accessing the Kubernetes API.</param>
     public ResourceInformer(
         IKubernetes client,
         IHostApplicationLifetime hostApplicationLifetime,
         ILogger<ResourceInformer<TResource>> logger,
         ResourceSelector<TResource>? selector = null,
         string? @namespace = null,
-        int resourceListLimit = 1000)
+        int resourceListLimit = 1000,
+        GroupApiVersionKind? groupApiVersionKind = null)
         : base(hostApplicationLifetime, logger)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -61,7 +63,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         _selector = selector;
         _namespace = @namespace;
         _resourceListLimit = resourceListLimit;
-        _names = GroupApiVersionKind.From<TResource>();
+        _groupApiVersionKind = groupApiVersionKind ?? GroupApiVersionKind.From<TResource>();
     }
 
     private enum EventType
@@ -226,9 +228,9 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         if (string.IsNullOrEmpty(_namespace))
         {
             var listWithHttpMessage = await Client.CustomObjects.ListClusterCustomObjectWithHttpMessagesAsync<KubernetesList<TResource>>(
-            _names.Group,
-            _names.ApiVersion,
-            _names.PluralName,
+            _groupApiVersionKind.Group,
+            _groupApiVersionKind.ApiVersion,
+            _groupApiVersionKind.PluralName,
             continueParameter: continueParameter,
             fieldSelector: resourceSelector?.FieldSelector,
             watch: watch,
@@ -241,10 +243,10 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         else
         {
             var listWithHttpMessage = await Client.CustomObjects.ListNamespacedCustomObjectWithHttpMessagesAsync<KubernetesList<TResource>>(
-            _names.Group,
-            _names.ApiVersion,
+            _groupApiVersionKind.Group,
+            _groupApiVersionKind.ApiVersion,
             _namespace,
-            _names.PluralName,
+            _groupApiVersionKind.PluralName,
             continueParameter: continueParameter,
             fieldSelector: resourceSelector?.FieldSelector,
             watch: watch,
@@ -294,8 +296,8 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
                 // These properties are not already set on items while listing
                 // assigned here for consistency
-                item.ApiVersion = _names.GroupApiVersion;
-                item.Kind = _names.Kind;
+                item.ApiVersion = _groupApiVersionKind.GroupApiVersion;
+                item.Kind = _groupApiVersionKind.Kind;
 
                 var key = NamespacedName.From(item);
                 _cache[key] = item?.Metadata?.OwnerReferences;
@@ -318,8 +320,8 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                 // send a deleted notification to clear any observer caches
                 var item = new TResource()
                 {
-                    ApiVersion = _names.GroupApiVersion,
-                    Kind = _names.Kind,
+                    ApiVersion = _groupApiVersionKind.GroupApiVersion,
+                    Kind = _groupApiVersionKind.Kind,
                     Metadata = new V1ObjectMeta()
                     {
                         Name = key.Name,
