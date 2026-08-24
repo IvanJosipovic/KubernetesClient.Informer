@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using k8s;
@@ -117,6 +118,9 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     /// <returns>A <see cref="Task"/> representing the result of the asynchronous operation.</returns>
     public override async Task RunAsync(CancellationToken cancellationToken)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(RunAsync), ActivityKind.Consumer);
+        SetResourceTags(activity);
+
         try
         {
             await _start.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -179,6 +183,15 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         }
         catch (Exception error)
         {
+            activity?.SetStatus(ActivityStatusCode.Error, error.Message);
+            activity?.AddEvent(new ActivityEvent(
+                "exception",
+                tags: new ActivityTagsCollection
+                {
+                    ["exception.type"] = error.GetType().FullName,
+                    ["exception.message"] = error.Message,
+                    ["exception.stacktrace"] = error.ToString()
+                }));
             Logger.LogInformation(
                 EventId(EventType.WatchingComplete),
                 error,
@@ -262,6 +275,10 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
     private async Task ListAsync(CancellationToken cancellationToken)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(ListAsync), ActivityKind.Client);
+        SetResourceTags(activity);
+        activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
+
         var previousCache = _cache;
         _cache = [];
 
@@ -343,10 +360,16 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
             EventId(EventType.SynchronizeComplete),
             "Completed synchronizing {ResourceType} resources from API server.",
             typeof(TResource).Name);
+        activity?.SetStatus(ActivityStatusCode.Ok);
+        activity?.SetTag("k8s.informer.resource_count", _cache.Count);
     }
 
     private async Task WatchAsync(CancellationToken cancellationToken)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(WatchAsync), ActivityKind.Client);
+        SetResourceTags(activity);
+        activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
+
         Logger.LogInformation(
             EventId(EventType.WatchingResource),
             "Watching {ResourceType} starting from resource version {ResourceVersion}.",
@@ -428,6 +451,13 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
 
     private void OnEvent(WatchEventType watchEventType, TResource item)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(OnEvent), ActivityKind.Internal);
+        SetResourceTags(activity);
+        activity?.SetTag("k8s.informer.event_type", watchEventType.ToString());
+        activity?.SetTag("k8s.resource.name", item.Name());
+        activity?.SetTag("k8s.resource.namespace", item.Namespace());
+        activity?.SetTag("k8s.resource.version", item.ResourceVersion());
+
         if (watchEventType != WatchEventType.Modified || item.Kind != "ConfigMap")
         {
             Logger.LogDebug(
@@ -467,6 +497,16 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         {
             InvokeRegistrationCallbacks(watchEventType, item);
         }
+    }
+
+    private void SetResourceTags(Activity? activity)
+    {
+        activity?.SetTag("k8s.resource.type", typeof(TResource).Name);
+        activity?.SetTag("k8s.group", _groupApiVersionKind.Group);
+        activity?.SetTag("k8s.version", _groupApiVersionKind.ApiVersion);
+        activity?.SetTag("k8s.resource.kind", _groupApiVersionKind.Kind);
+        activity?.SetTag("k8s.resource.plural", _groupApiVersionKind.PluralName);
+        activity?.SetTag("k8s.namespace.name", _namespace);
     }
 
     private void InvokeRegistrationCallbacks(WatchEventType eventType, TResource resource)
