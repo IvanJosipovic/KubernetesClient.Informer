@@ -151,6 +151,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                 }
                 catch (IOException ex) when (ex.InnerException is SocketException)
                 {
+                    InformerDiagnostics.RecordException(activity, ex);
                     Logger.LogDebug(
                         EventId(EventType.ReceivedError),
                         "Received error watching {ResourceType}: {ErrorMessage}",
@@ -159,6 +160,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                 }
                 catch (KubernetesException ex)
                 {
+                    InformerDiagnostics.RecordException(activity, ex);
                     Logger.LogDebug(
                         EventId(EventType.ReceivedError),
                         "Received error watching {ResourceType}: {ErrorMessage}",
@@ -183,15 +185,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         }
         catch (Exception error)
         {
-            activity?.SetStatus(ActivityStatusCode.Error, error.Message);
-            activity?.AddEvent(new ActivityEvent(
-                "exception",
-                tags: new ActivityTagsCollection
-                {
-                    ["exception.type"] = error.GetType().FullName,
-                    ["exception.message"] = error.Message,
-                    ["exception.stacktrace"] = error.ToString()
-                }));
+            InformerDiagnostics.RecordException(activity, error);
             Logger.LogInformation(
                 EventId(EventType.WatchingComplete),
                 error,
@@ -279,89 +273,101 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         SetResourceTags(activity);
         activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
 
-        var previousCache = _cache;
-        _cache = [];
-
-        if (_selector?.FieldSelector is not null)
+        try
         {
-            Logger.LogInformation(
-                EventId(EventType.SynchronizeStarted),
-                "Started synchronizing {ResourceType} resources from API server with field selector '{FieldSelector}'.",
-                typeof(TResource).Name,
-                _selector.FieldSelector);
-        }
-        else
-        {
-            Logger.LogInformation(
-                EventId(EventType.SynchronizeStarted),
-                "Started synchronizing {ResourceType} resources from API server.",
-                typeof(TResource).Name);
-        }
+            var previousCache = _cache;
+            _cache = [];
 
-        string? continueParameter = null;
-        do
-        {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (_selector?.FieldSelector is not null)
+            {
+                Logger.LogInformation(
+                    EventId(EventType.SynchronizeStarted),
+                    "Started synchronizing {ResourceType} resources from API server with field selector '{FieldSelector}'.",
+                    typeof(TResource).Name,
+                    _selector.FieldSelector);
+            }
+            else
+            {
+                Logger.LogInformation(
+                    EventId(EventType.SynchronizeStarted),
+                    "Started synchronizing {ResourceType} resources from API server.",
+                    typeof(TResource).Name);
+            }
 
-            // request next page of items
-            using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: _resourceListLimit, cancellationToken: cancellationToken).ConfigureAwait(false);
-
-            var list = listWithHttpMessage.Body;
-            foreach (var item in list.Items)
+            string? continueParameter = null;
+            do
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // These properties are not already set on items while listing
-                // assigned here for consistency
-                item.ApiVersion = _groupApiVersionKind.GroupApiVersion;
-                item.Kind = _groupApiVersionKind.Kind;
+                // request next page of items
+                using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: _resourceListLimit, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-                var key = NamespacedName.From(item);
-                _cache[key] = item?.Metadata?.OwnerReferences;
-
-                var watchEventType = WatchEventType.Added;
-                if (previousCache.Remove(key))
+                var list = listWithHttpMessage.Body;
+                foreach (var item in list.Items)
                 {
-                    // an already-known key is provided as a modification for re-sync purposes
-                    watchEventType = WatchEventType.Modified;
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // These properties are not already set on items while listing
+                    // assigned here for consistency
+                    item.ApiVersion = _groupApiVersionKind.GroupApiVersion;
+                    item.Kind = _groupApiVersionKind.Kind;
+
+                    var key = NamespacedName.From(item);
+                    _cache[key] = item?.Metadata?.OwnerReferences;
+
+                    var watchEventType = WatchEventType.Added;
+                    if (previousCache.Remove(key))
+                    {
+                        // an already-known key is provided as a modification for re-sync purposes
+                        watchEventType = WatchEventType.Modified;
+                    }
+
+                    InvokeRegistrationCallbacks(watchEventType, item);
                 }
 
-                InvokeRegistrationCallbacks(watchEventType, item);
-            }
-
-            foreach (var (key, value) in previousCache)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // for anything which was previously known but not part of list
-                // send a deleted notification to clear any observer caches
-                var item = new TResource()
+                foreach (var (key, value) in previousCache)
                 {
-                    ApiVersion = _groupApiVersionKind.GroupApiVersion,
-                    Kind = _groupApiVersionKind.Kind,
-                    Metadata = new V1ObjectMeta()
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // for anything which was previously known but not part of list
+                    // send a deleted notification to clear any observer caches
+                    var item = new TResource()
                     {
-                        Name = key.Name,
-                        NamespaceProperty = key.Namespace,
-                        OwnerReferences = value
-                    }
-                };
+                        ApiVersion = _groupApiVersionKind.GroupApiVersion,
+                        Kind = _groupApiVersionKind.Kind,
+                        Metadata = new V1ObjectMeta()
+                        {
+                            Name = key.Name,
+                            NamespaceProperty = key.Namespace,
+                            OwnerReferences = value
+                        }
+                    };
 
-                InvokeRegistrationCallbacks(WatchEventType.Deleted, item);
+                    InvokeRegistrationCallbacks(WatchEventType.Deleted, item);
+                }
+
+                // keep track of values needed for next page and to start watching
+                _lastResourceVersion = list.ResourceVersion();
+                continueParameter = list.Continue();
             }
+            while (!string.IsNullOrEmpty(continueParameter));
 
-            // keep track of values needed for next page and to start watching
-            _lastResourceVersion = list.ResourceVersion();
-            continueParameter = list.Continue();
+            Logger.LogInformation(
+                EventId(EventType.SynchronizeComplete),
+                "Completed synchronizing {ResourceType} resources from API server.",
+                typeof(TResource).Name);
+            activity?.SetStatus(ActivityStatusCode.Ok);
+            activity?.SetTag("k8s.informer.resource_count", _cache.Count);
         }
-        while (!string.IsNullOrEmpty(continueParameter));
-
-        Logger.LogInformation(
-            EventId(EventType.SynchronizeComplete),
-            "Completed synchronizing {ResourceType} resources from API server.",
-            typeof(TResource).Name);
-        activity?.SetStatus(ActivityStatusCode.Ok);
-        activity?.SetTag("k8s.informer.resource_count", _cache.Count);
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception error)
+        {
+            InformerDiagnostics.RecordException(activity, error);
+            throw;
+        }
     }
 
     private async Task WatchAsync(CancellationToken cancellationToken)
@@ -370,82 +376,103 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         SetResourceTags(activity);
         activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
 
-        Logger.LogInformation(
-            EventId(EventType.WatchingResource),
-            "Watching {ResourceType} starting from resource version {ResourceVersion}.",
-            typeof(TResource).Name,
-            _lastResourceVersion);
-
-        // completion source helps turn OnClose callback into something awaitable
-        var watcherCompletionSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        // begin watching where list left off
-        var watchWithHttpMessage = RetrieveResourceListAsync(watch: true, resourceVersion: _lastResourceVersion, resourceSelector: _selector, cancellationToken: cancellationToken);
-
-        var lastEventUtc = DateTime.UtcNow;
-#pragma warning disable CS0618 // Type or member is obsolete
-        using var watcher = watchWithHttpMessage.Watch<TResource, KubernetesList<TResource>>(
-            (watchEventType, item) =>
-            {
-                if (!watcherCompletionSource.Task.IsCompleted)
-                {
-                    lastEventUtc = DateTime.UtcNow;
-                    OnEvent(watchEventType, item);
-                }
-            },
-            error =>
-            {
-                if (error is KubernetesException kubernetesError)
-                {
-                    // deal with this non-recoverable condition "too old resource version"
-                    if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
-                    {
-                        // cause this error to surface
-                        watcherCompletionSource.TrySetException(error);
-                        ExceptionDispatchInfo.Capture(error).Throw();
-                    }
-                }
-
-                Logger.LogDebug(
-                    EventId(EventType.IgnoringError),
-                    "Ignoring error {ErrorType}: {ErrorMessage}",
-                    error.GetType().Name,
-                    error.Message);
-            },
-            () =>
-            {
-                watcherCompletionSource.TrySetResult(0);
-            });
-#pragma warning restore CS0618 // Type or member is obsolete
-
-        // reconnect if no events have arrived after a certain time
-        using var checkLastEventUtcTimer = new Timer(
-            _ =>
-            {
-                var lastEvent = DateTime.UtcNow - lastEventUtc;
-                if (lastEvent > TimeSpan.FromMinutes(9.5))
-                {
-                    lastEventUtc = DateTime.MaxValue;
-                    Logger.LogDebug(
-                        EventId(EventType.DisposingToReconnect),
-                        "Disposing watcher for {ResourceType} to cause reconnect.",
-                        typeof(TResource).Name);
-
-                    watcherCompletionSource.TrySetCanceled();
-                    watcher.Dispose();
-                }
-            },
-            state: null,
-            dueTime: TimeSpan.FromSeconds(45),
-            period: TimeSpan.FromSeconds(45));
-
-        using var registration = cancellationToken.Register(watcher.Dispose);
         try
         {
-            await watcherCompletionSource.Task.ConfigureAwait(false);
+            Logger.LogInformation(
+                EventId(EventType.WatchingResource),
+                "Watching {ResourceType} starting from resource version {ResourceVersion}.",
+                typeof(TResource).Name,
+                _lastResourceVersion);
+
+            // completion source helps turn OnClose callback into something awaitable
+            var watcherCompletionSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            // begin watching where list left off
+            var watchWithHttpMessage = RetrieveResourceListAsync(watch: true, resourceVersion: _lastResourceVersion, resourceSelector: _selector, cancellationToken: cancellationToken);
+
+            var lastEventUtc = DateTime.UtcNow;
+#pragma warning disable CS0618 // Type or member is obsolete
+            using var watcher = watchWithHttpMessage.Watch<TResource, KubernetesList<TResource>>(
+                (watchEventType, item) =>
+                {
+                    if (!watcherCompletionSource.Task.IsCompleted)
+                    {
+                        lastEventUtc = DateTime.UtcNow;
+                        OnEvent(watchEventType, item);
+                    }
+                },
+                error =>
+                {
+                    if (error is KubernetesException kubernetesError)
+                    {
+                        // deal with this non-recoverable condition "too old resource version"
+                        if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
+                        {
+                            // cause this error to surface
+                            watcherCompletionSource.TrySetException(error);
+                            ExceptionDispatchInfo.Capture(error).Throw();
+                        }
+                    }
+
+                    Logger.LogDebug(
+                        EventId(EventType.IgnoringError),
+                        "Ignoring error {ErrorType}: {ErrorMessage}",
+                        error.GetType().Name,
+                        error.Message);
+                },
+                () =>
+                {
+                    watcherCompletionSource.TrySetResult(0);
+                });
+#pragma warning restore CS0618 // Type or member is obsolete
+
+            // reconnect if no events have arrived after a certain time
+            using var checkLastEventUtcTimer = new Timer(
+                _ =>
+                {
+                    var lastEvent = DateTime.UtcNow - lastEventUtc;
+                    if (lastEvent > TimeSpan.FromMinutes(9.5))
+                    {
+                        lastEventUtc = DateTime.MaxValue;
+                        Logger.LogDebug(
+                            EventId(EventType.DisposingToReconnect),
+                            "Disposing watcher for {ResourceType} to cause reconnect.",
+                            typeof(TResource).Name);
+
+                        watcherCompletionSource.TrySetCanceled();
+                        watcher.Dispose();
+                    }
+                },
+                state: null,
+                dueTime: TimeSpan.FromSeconds(45),
+                period: TimeSpan.FromSeconds(45));
+
+            using var registration = cancellationToken.Register(watcher.Dispose);
+            try
+            {
+                await watcherCompletionSource.Task.ConfigureAwait(false);
+            }
+            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception error)
+            {
+                InformerDiagnostics.RecordException(activity, error);
+                throw;
+            }
         }
-        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            throw;
+        }
+        catch (Exception error)
+        {
+            InformerDiagnostics.RecordException(activity, error);
+            throw;
         }
     }
 
@@ -458,7 +485,7 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         activity?.SetTag("k8s.resource.namespace", item.Namespace());
         activity?.SetTag("k8s.resource.version", item.ResourceVersion());
 
-        if (watchEventType != WatchEventType.Modified || item.Kind != "ConfigMap")
+        try
         {
             Logger.LogDebug(
                 EventId(EventType.InformerWatchEvent),
@@ -469,33 +496,38 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                 item.Name(),
                 item.Namespace(),
                 item.ResourceVersion());
-        }
 
-        if (watchEventType == WatchEventType.Added ||
-            watchEventType == WatchEventType.Modified)
-        {
-            // BUGBUG: log warning if cache was not in expected state
-            _cache[NamespacedName.From(item)] = item.Metadata?.OwnerReferences;
-        }
+            if (watchEventType == WatchEventType.Added ||
+                watchEventType == WatchEventType.Modified)
+            {
+                // BUGBUG: log warning if cache was not in expected state
+                _cache[NamespacedName.From(item)] = item.Metadata?.OwnerReferences;
+            }
 
-        if (watchEventType == WatchEventType.Deleted)
-        {
-            _cache.Remove(NamespacedName.From(item));
-        }
+            if (watchEventType == WatchEventType.Deleted)
+            {
+                _cache.Remove(NamespacedName.From(item));
+            }
 
-        if (watchEventType == WatchEventType.Added ||
-            watchEventType == WatchEventType.Modified ||
-            watchEventType == WatchEventType.Deleted ||
-            watchEventType == WatchEventType.Bookmark)
-        {
-            _lastResourceVersion = item.ResourceVersion();
-        }
+            if (watchEventType == WatchEventType.Added ||
+                watchEventType == WatchEventType.Modified ||
+                watchEventType == WatchEventType.Deleted ||
+                watchEventType == WatchEventType.Bookmark)
+            {
+                _lastResourceVersion = item.ResourceVersion();
+            }
 
-        if (watchEventType == WatchEventType.Added ||
-            watchEventType == WatchEventType.Modified ||
-            watchEventType == WatchEventType.Deleted)
+            if (watchEventType == WatchEventType.Added ||
+                watchEventType == WatchEventType.Modified ||
+                watchEventType == WatchEventType.Deleted)
+            {
+                InvokeRegistrationCallbacks(watchEventType, item);
+            }
+        }
+        catch (Exception error)
         {
-            InvokeRegistrationCallbacks(watchEventType, item);
+            InformerDiagnostics.RecordException(activity, error);
+            throw;
         }
     }
 
