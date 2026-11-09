@@ -2,11 +2,7 @@
 
   <PropertyGroup>
     <Description>A Kubernetes Resource Informer implementation based on YARP KubernetesClient.Informer</Description>
-    <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
     <OutputType>Library</OutputType>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
     <NoWarn>$(NoWarn);CS8002</NoWarn>
     <IsPackable>true</IsPackable>
     <PackageTags>resource informer;dotnet;kubernetes</PackageTags>

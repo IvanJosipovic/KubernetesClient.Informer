@@ -4,6 +4,7 @@
 using k8s.Models;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using KubernetesClient.Informer.Tests.TestCluster.Models;
@@ -33,10 +34,11 @@ public class ResourceApiController : ControllerBase
         {
             await _testCluster.ListResourcesAsync(string.Empty, Version, Plural, parameters);
             Response.ContentType = "application/json";
-            foreach (var watchEvent in _testCluster.WatchEvents)
+            foreach (var watchEvent in _testCluster.WatchEvents.ToArray())
             {
                 await Response.WriteAsync(JsonSerializer.Serialize(watchEvent));
                 await Response.WriteAsync("\n");
+                _testCluster.WatchEvents.Remove(watchEvent);
             }
 
             return new EmptyResult();

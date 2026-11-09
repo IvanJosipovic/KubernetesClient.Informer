@@ -3,6 +3,7 @@
 
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Net;
 using System.Net.Sockets;
 using k8s;
 using k8s.Autorest;
@@ -131,10 +132,17 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <inheritdoc/>
     public void StartWatching()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
-        Status = ResourceInformerStatus.Starting;
-        _start.TrySetResult();
+            if (Status == ResourceInformerStatus.NotStarted)
+            {
+                Status = ResourceInformerStatus.Starting;
+            }
+
+            _start.TrySetResult();
+        }
     }
 
     /// <inheritdoc/>
@@ -264,6 +272,15 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             {
                 LogWatchError(ex);
             }
+            catch (HttpOperationException ex) when (IsRetryable(ex))
+            {
+                LogWatchError(ex);
+
+                if (IsExpiredResourceVersion(ex))
+                {
+                    shouldSync = true;
+                }
+            }
             catch (KubernetesException ex)
             {
                 LogWatchError(ex);
@@ -295,14 +312,22 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private static bool IsExpiredResourceVersion(KubernetesException exception)
         => string.Equals(exception.Status?.Reason, "Expired", StringComparison.Ordinal);
 
+    private static bool IsExpiredResourceVersion(HttpOperationException exception)
+        => exception.Response?.StatusCode == HttpStatusCode.Gone;
+
     private static bool IsRetryable(Exception exception)
         => exception switch
         {
             HttpRequestException => true,
+            HttpOperationException httpOperationException => IsRetryableHttpStatus(httpOperationException.Response?.StatusCode),
             KubernetesException => true,
             IOException { InnerException: SocketException } => true,
             _ => false,
         };
+
+    private static bool IsRetryableHttpStatus(HttpStatusCode? statusCode)
+        => statusCode is HttpStatusCode.Gone or HttpStatusCode.TooManyRequests
+            || statusCode is { } code && (int)code is >= 500 and <= 599;
 
     private Task<HttpOperationResponse<TResponse>> CreateResponseAsync<TResponse>(bool? watch, int? limit, bool? allowWatchBookmarks, string? continueParameter, string? resourceVersion, CancellationToken cancellationToken)
         where TResponse : class
