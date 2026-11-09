@@ -6,3 +6,14 @@
 
 
 A Kubernetes Resource Informer implementation based on [Yarp.Kubernetes.Controller](https://github.com/dotnet/yarp/tree/main/src/Kubernetes.Controller)
+
+## OpenTelemetry tracing
+
+Informers emit OpenTelemetry activities from the `KubernetesClient.Informer` activity source. Register that source with the application's OpenTelemetry tracing provider:
+
+```csharp
+services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddSource(InformerDiagnostics.ActivitySourceName));
+```
+
+The source includes spans for the informer lifecycle, Kubernetes resource listing, watch connections, and individual watch events. Spans include resource group, version, kind, namespace, and event details where available.

@@ -9,6 +9,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
+using System.Reflection;
 using Xunit;
 using KubernetesClient.Informer.Common;
 using KubernetesClient.Informer.Tests.TestCluster;
@@ -20,6 +21,28 @@ namespace KubernetesClient.Informer.Client.Tests;
 
 public class ResourceInformerTests
 {
+    [Fact]
+    public void ConstructorUsesSpecifiedNamesOrResourceNamesWhenNamesAreNull()
+    {
+        var specifiedNames = new GroupApiVersionKind("custom.example.com", "v1", "CustomResource", "customresources");
+
+        using var informerWithSpecifiedNames = new ResourceInformer<V1Pod>(
+            new Mock<IKubernetes>().Object,
+            new Mock<IHostApplicationLifetime>().Object,
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            groupApiVersionKind: specifiedNames);
+        using var informerWithDefaultNames = new ResourceInformer<V1Pod>(
+            new Mock<IKubernetes>().Object,
+            new Mock<IHostApplicationLifetime>().Object,
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+
+        var namesField = typeof(ResourceInformer<V1Pod>).GetField("_groupApiVersionKind", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        Assert.NotNull(namesField);
+        Assert.Equal(specifiedNames, namesField.GetValue(informerWithSpecifiedNames));
+        Assert.Equal(GroupApiVersionKind.From<V1Pod>(), namesField.GetValue(informerWithDefaultNames));
+    }
+
     private static (TResources Resources, TShouldBe ShouldBe) LoadTestResource<TResources, TShouldBe>(string name)
     {
         var resourcesYaml = File.ReadAllText(Path.Combine("testassets/resource-informer", name, "resources.yaml"));

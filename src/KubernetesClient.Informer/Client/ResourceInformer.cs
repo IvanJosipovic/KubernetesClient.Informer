@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Net.Sockets;
 using k8s;
 using k8s.Autorest;
@@ -26,11 +27,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
     private readonly object _sync = new();
-    private readonly GroupApiVersionKind _names;
-    private readonly SemaphoreSlim _ready = new(0);
-    private readonly SemaphoreSlim _start = new(0);
-    private int _startWaited;
-    private int _startSignaled;
+    private readonly GroupApiVersionKind _groupApiVersionKind;
+    private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _start = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ResourceSelector<TResource>? _selector;
     private ImmutableList<Registration> _registrations = [];
     private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
@@ -72,14 +71,16 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <param name="namespace">The Namespace to scope the informer.</param>
     /// <param name="timeoutSeconds">The timeout in seconds for list and watch operations.</param>
     /// <param name="resourceListLimit">The maximum number of resources to request in each list page.</param>
+    /// <param name="groupApiVersionKind">The resource group, API version, kind, and plural name to use when accessing the Kubernetes API.</param>
     public ResourceInformer(
         IKubernetes client,
         IHostApplicationLifetime hostApplicationLifetime,
         ILogger<ResourceInformer<TResource>> logger,
         ResourceSelector<TResource>? selector = null,
         string? @namespace = null,
+        int resourceListLimit = 1000,
         int? timeoutSeconds = null,
-        int resourceListLimit = 1000)
+        GroupApiVersionKind? groupApiVersionKind = null)
         : base(hostApplicationLifetime, logger)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -88,7 +89,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         Client = client;
         _selector = selector;
         _namespace = @namespace;
-        _names = GroupApiVersionKind.From<TResource>();
+        _groupApiVersionKind = groupApiVersionKind ?? GroupApiVersionKind.From<TResource>();
         _timeoutSeconds = timeoutSeconds;
         _resourceListLimit = resourceListLimit;
     }
@@ -116,17 +117,12 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         {
             lock (_sync)
             {
-                if (_disposed)
+                if (!_disposed)
                 {
-                    return;
+                    _disposed = true;
+                    _registrations = [];
                 }
-
-                _disposed = true;
-                _registrations = [];
             }
-
-            _ready.Dispose();
-            _start.Dispose();
         }
 
         base.Dispose(disposing);
@@ -138,10 +134,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         Status = ResourceInformerStatus.Starting;
-        if (Interlocked.Exchange(ref _startSignaled, 1) == 0)
-        {
-            _start.Release();
-        }
+        _start.TrySetResult();
     }
 
     /// <inheritdoc/>
@@ -165,25 +158,19 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <inheritdoc/>
     public virtual async Task ReadyAsync(CancellationToken cancellationToken)
     {
-        await _ready.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        // Release is called after each WaitAsync because
-        // the semaphore is being used as a manual reset event
-        _ready.Release();
+        await _ready.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
     public override async Task RunAsync(CancellationToken cancellationToken)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(RunAsync), ActivityKind.Consumer);
+        SetResourceTags(activity);
         Status = ResourceInformerStatus.Starting;
 
         try
         {
-            // Wait only for the first RunAsync invocation; retries should continue immediately.
-            if (Interlocked.Exchange(ref _startWaited, 1) == 0)
-            {
-                await _start.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
+            await _start.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
 
             await RunListWatchAsync(cancellationToken).ConfigureAwait(true);
         }
@@ -199,6 +186,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         catch (Exception error)
         {
             Status = ResourceInformerStatus.Faulted;
+            InformerDiagnostics.RecordException(activity, error);
             Logger.LogError(
                 EventId(EventType.WatchingFailed),
                 error,
@@ -261,7 +249,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
                 if (firstSync)
                 {
-                    _ready.Release();
+                    _ready.TrySetResult();
                     firstSync = false;
                 }
 
@@ -296,6 +284,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private void LogWatchError(Exception error)
     {
+        InformerDiagnostics.RecordException(Activity.Current, error);
         Logger.LogDebug(
             EventId(EventType.ReceivedError),
             "Received error watching {ResourceType}: {ErrorMessage}",
@@ -321,9 +310,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         if (string.IsNullOrEmpty(_namespace))
         {
             return Client.CustomObjects.ListClusterCustomObjectWithHttpMessagesAsync<TResponse>(
-                _names.Group,
-                _names.ApiVersion,
-                _names.PluralName,
+                _groupApiVersionKind.Group,
+                _groupApiVersionKind.ApiVersion,
+                _groupApiVersionKind.PluralName,
                 allowWatchBookmarks: allowWatchBookmarks,
                 continueParameter: continueParameter,
                 fieldSelector: _selector?.FieldSelector,
@@ -335,10 +324,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         }
 
         return Client.CustomObjects.ListNamespacedCustomObjectWithHttpMessagesAsync<TResponse>(
-            _names.Group,
-            _names.ApiVersion,
+            _groupApiVersionKind.Group,
+            _groupApiVersionKind.ApiVersion,
             _namespace,
-            _names.PluralName,
+            _groupApiVersionKind.PluralName,
             allowWatchBookmarks: allowWatchBookmarks,
             continueParameter: continueParameter,
             fieldSelector: _selector?.FieldSelector,
@@ -351,6 +340,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private async Task ListAsync(CancellationToken cancellationToken)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(ListAsync), ActivityKind.Client);
+        SetResourceTags(activity);
+        activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
+
         var previousCache = _cache;
         var nextCache = new Dictionary<NamespacedName, IList<V1OwnerReference>>();
         var listedItems = new List<(WatchEventType EventType, TResource Resource)>();
@@ -392,8 +385,8 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             {
                 // These properties are not already set on items while listing
                 // assigned here for consistency
-                item.ApiVersion = _names.GroupApiVersion;
-                item.Kind = _names.Kind;
+                item.ApiVersion = _groupApiVersionKind.GroupApiVersion;
+                item.Kind = _groupApiVersionKind.Kind;
 
                 var key = NamespacedName.From(item);
                 nextCache[key] = item?.Metadata?.OwnerReferences;
@@ -433,8 +426,8 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             // send a deleted notification to clear any observer caches
             var item = new TResource()
             {
-                ApiVersion = _names.GroupApiVersion,
-                Kind = _names.Kind,
+                ApiVersion = _groupApiVersionKind.GroupApiVersion,
+                Kind = _groupApiVersionKind.Kind,
                 Metadata = new V1ObjectMeta()
                 {
                     Name = key.Name,
@@ -450,10 +443,16 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             EventId(EventType.SynchronizeComplete),
             "Completed synchronizing {ResourceType} resources from API server.",
             typeof(TResource).Name);
+        activity?.SetStatus(ActivityStatusCode.Ok);
+        activity?.SetTag("k8s.informer.resource_count", _cache.Count);
     }
 
     private async Task WatchAsync(CancellationToken cancellationToken)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(WatchAsync), ActivityKind.Client);
+        SetResourceTags(activity);
+        activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
+
         Logger.LogInformation(EventId(EventType.WatchingResource), "Watching {ResourceType} starting from resource version {ResourceVersion}.", typeof(TResource).Name, _lastResourceVersion);
 
         var lastEventUtc = DateTime.UtcNow;
@@ -506,6 +505,13 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private void OnEvent(WatchEventType watchEventType, TResource item)
     {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(OnEvent), ActivityKind.Internal);
+        SetResourceTags(activity);
+        activity?.SetTag("k8s.informer.event_type", watchEventType.ToString());
+        activity?.SetTag("k8s.resource.name", item.Name());
+        activity?.SetTag("k8s.resource.namespace", item.Namespace());
+        activity?.SetTag("k8s.resource.version", item.ResourceVersion());
+
         Logger.LogDebug(
             EventId(EventType.InformerWatchEvent),
             "Informer {ResourceType} received {WatchEventType} notification for {ItemKind}/{ItemName}.{ItemNamespace} at resource version {ResourceVersion}",
@@ -542,6 +548,16 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         {
             InvokeRegistrationCallbacks(watchEventType, item);
         }
+    }
+
+    private void SetResourceTags(Activity? activity)
+    {
+        activity?.SetTag("k8s.resource.type", typeof(TResource).Name);
+        activity?.SetTag("k8s.group", _groupApiVersionKind.Group);
+        activity?.SetTag("k8s.version", _groupApiVersionKind.ApiVersion);
+        activity?.SetTag("k8s.resource.kind", _groupApiVersionKind.Kind);
+        activity?.SetTag("k8s.resource.plural", _groupApiVersionKind.PluralName);
+        activity?.SetTag("k8s.namespace.name", _namespace);
     }
 
     private void InvokeRegistrationCallbacks(WatchEventType eventType, TResource resource)
