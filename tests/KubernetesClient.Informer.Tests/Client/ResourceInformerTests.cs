@@ -578,6 +578,61 @@ public class ResourceInformerTests
             eventTypes);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task HostedInformerPublishesDeletedWatchEventsWithConfiguredStartBehavior(bool startWatchingOnHostStart)
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.WatchEvents.Add(new WatchEvent
+        {
+            Type = "DELETED",
+            Object = new ResourceObject
+            {
+                ApiVersion = "v1",
+                Kind = "Pod",
+                Metadata = new V1ObjectMeta { Name = "pod", NamespaceProperty = "default", ResourceVersion = "1" },
+            },
+        });
+
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var testHost = new HostBuilder()
+            .ConfigureServices((context, services) =>
+            {
+                services.RegisterResourceInformer<V1Pod>(startWatchingOnHostStart);
+                services.Configure<KubernetesClientOptions>(options =>
+                {
+                    options.Configuration = KubernetesClientConfiguration.BuildConfigFromConfigObject(clusterHost.KubeConfig);
+                });
+                services.AddKubernetesCore();
+            })
+            .Build();
+
+        var informer = testHost.Services.GetRequiredService<IResourceInformer<V1Pod>>();
+        var deletedPod = new TaskCompletionSource<V1Pod>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = informer.Register((eventType, pod) =>
+        {
+            if (eventType == WatchEventType.Deleted)
+            {
+                deletedPod.TrySetResult(pod);
+            }
+        });
+
+        await testHost.StartAsync(cancellation.Token);
+        if (!startWatchingOnHostStart)
+        {
+            informer.StartWatching();
+        }
+
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        var deleted = await deletedPod.Task.DefaultTimeout();
+        Assert.Equal("pod", deleted.Metadata?.Name);
+        Assert.Equal("default", deleted.Metadata?.NamespaceProperty);
+    }
+
     [Fact]
     public async Task MultipleRegistrationsReceiveTheSameInitialEvents()
     {

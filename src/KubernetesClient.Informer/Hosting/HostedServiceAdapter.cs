@@ -4,6 +4,7 @@
 using Microsoft.Extensions.Hosting;
 using System.Threading;
 using System.Threading.Tasks;
+using KubernetesClient.Informer.Client;
 
 namespace KubernetesClient.Informer.Hosting;
 
@@ -15,14 +16,31 @@ public class HostedServiceAdapter<TService> : IHostedService
     where TService : IHostedService
 {
     private readonly TService _service;
+    private readonly bool _startWatchingOnHostStart;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="HostedServiceAdapter{TInterface}" /> class.
     /// </summary>
     /// <param name="service">The service interface to delegate onto.</param>
-    public HostedServiceAdapter(TService service) => _service = service;
+    public HostedServiceAdapter(TService service) : this(service, startWatchingOnHostStart: true)
+    {
+    }
 
-    public Task StartAsync(CancellationToken cancellationToken) => _service.StartAsync(cancellationToken);
+    internal HostedServiceAdapter(TService service, bool startWatchingOnHostStart)
+    {
+        _service = service;
+        _startWatchingOnHostStart = startWatchingOnHostStart;
+    }
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (_startWatchingOnHostStart && _service is IResourceInformer informer)
+        {
+            informer.StartWatching();
+        }
+
+        return _service.StartAsync(cancellationToken);
+    }
 
     public Task StopAsync(CancellationToken cancellationToken) => _service.StopAsync(cancellationToken);
 }

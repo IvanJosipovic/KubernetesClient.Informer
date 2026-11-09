@@ -57,7 +57,8 @@ public interface IResourceInformer
     ResourceInformerStatus Status { get; }
 
     /// <summary>
-    /// Instructs the resource informer to being watching resources. Allows the startup of informers to be synchronised.
+    /// Signals the resource informer to begin listing and watching resources. This is called automatically when the
+    /// informer is registered with the host unless host-start watching is disabled for coordinated startup.
     /// </summary>
     void StartWatching();
 

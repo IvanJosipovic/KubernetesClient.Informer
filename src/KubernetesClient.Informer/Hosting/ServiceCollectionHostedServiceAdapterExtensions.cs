@@ -20,10 +20,15 @@ public static class ServiceCollectionHostedServiceAdapterExtensions
     /// <returns>IServiceCollection.</returns>
     public static IServiceCollection RegisterHostedService<TService>(this IServiceCollection services)
         where TService : IHostedService
+        => services.RegisterHostedService<TService>(startWatchingOnHostStart: true);
+
+    internal static IServiceCollection RegisterHostedService<TService>(this IServiceCollection services, bool startWatchingOnHostStart)
+        where TService : IHostedService
     {
         if (!services.Any(serviceDescriptor => serviceDescriptor.ServiceType == typeof(HostedServiceAdapter<TService>)))
         {
-            services = services.AddHostedService<HostedServiceAdapter<TService>>();
+            services = services.AddHostedService<HostedServiceAdapter<TService>>(serviceProvider =>
+                new HostedServiceAdapter<TService>(serviceProvider.GetRequiredService<TService>(), startWatchingOnHostStart));
         }
 
         return services;
