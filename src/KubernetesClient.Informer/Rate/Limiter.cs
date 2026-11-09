@@ -171,13 +171,13 @@ public class Limiter
                 var delay = r.DelayFrom(now);
                 if (delay > TimeSpan.Zero)
                 {
-                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(delay, _timeProvider, cancellationToken).ConfigureAwait(false);
                 }
 
                 return;
             }
 
-            await Task.Delay(waitLimit, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(waitLimit, _timeProvider, cancellationToken).ConfigureAwait(false);
         }
     }
 

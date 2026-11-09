@@ -18,9 +18,12 @@ namespace KubernetesClient.Informer.Client;
 /// <param name="eventType">The type of change event which was received.</param>
 /// <param name="resource">The instance of the resource which was received.</param>
 /// <remarks>
-/// Callbacks run synchronously on the informer processing path; keep them short and non-blocking. An unhandled
-/// callback exception faults the informer. A deletion caused by relisting supplies the last object observed by
-/// this informer, while a watch deletion supplies the object from the watch event.
+/// Callbacks are delivered asynchronously and sequentially for each registration; different registrations may be
+/// invoked concurrently. Keep them short and non-blocking. If a callback throws, the error is logged and that
+/// registration is removed; the informer and other registrations continue. A deletion caused by relisting supplies
+/// the last object observed by this informer, while a watch deletion supplies
+/// the object from the watch event. When a callback is registered after the initial list has completed, the current
+/// cached resources are queued for it as Added notifications before Register returns.
 /// </remarks>
 public delegate void ResourceInformerCallback<TResource>(WatchEventType eventType, TResource resource) where TResource : class, IKubernetesObject<V1ObjectMeta>;
 
@@ -38,10 +41,11 @@ public interface IResourceInformer<TResource> : IHostedService, IResourceInforme
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
     /// <summary>
-    /// Registers a callback for change notification. Registration must happen before the informer's initial
-    /// list begins; a later registration is rejected because it would otherwise miss the initial resource state.
-    /// The registration may be created in the constructor of a dependant <see cref="IHostedService"/>. The returned
-    /// registration should be disposed when the receiver is ending its work.
+    /// Registers a callback for change notification. A callback registered before the initial list completes
+    /// receives that list. A callback registered after the initial list completes receives the current cached
+    /// resources as Added notifications before this method returns, then receives subsequent changes. These
+    /// notifications are delivered asynchronously. The returned registration should be disposed when the receiver
+    /// is ending its work.
     /// </summary>
     /// <param name="callback">The delegate that is invoked with each resource notification.</param>
     /// <returns>A registration that should be disposed to end the notifications.</returns>
@@ -69,20 +73,22 @@ public interface IResourceInformer
     void StartWatching();
 
     /// <summary>
-    /// Returns a task that can be awaited to know when the initial listing and callback delivery are complete.
-    /// Once this task completes successfully, the initial resource state has been made available and subsequent
-    /// changes will be delivered as updates. If the informer terminates before the initial sync, the task faults
-    /// or is canceled with the run.
+    /// Returns a task that can be awaited to know when the initial listing and its notifications to registrations
+    /// present at initial sync are complete. Use the returned registration's ReadyAsync to wait for that specific
+    /// registration, including a late registration's cached-state replay. If a callback for a registration throws
+    /// during initial delivery, that registration's ReadyAsync faults, but the informer continues. If the informer
+    /// terminates before the initial sync, this task faults or is canceled with the run.
     /// </summary>
     /// <param name="cancellationToken">The cancellation token that can be used by other objects or threads to receive notice of cancellation.</param>
     /// <returns>Task.</returns>
     Task ReadyAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// Registers a callback for change notification. Registration must happen before the informer's initial
-    /// list begins; a later registration is rejected because it would otherwise miss the initial resource state.
-    /// The registration may be created in the constructor of a dependant <see cref="IHostedService"/>. The returned
-    /// registration should be disposed when the receiver is ending its work.
+    /// Registers a callback for change notification. A callback registered before the initial list completes
+    /// receives that list. A callback registered after the initial list completes receives the current cached
+    /// resources as Added notifications before this method returns, then receives subsequent changes. These
+    /// notifications are delivered asynchronously. The returned registration should be disposed when the receiver
+    /// is ending its work.
     /// </summary>
     /// <param name="callback">The delegate that is invoked with each resource notification.</param>
     /// <returns>A registration that should be disposed to end the notifications.</returns>

@@ -3,6 +3,8 @@
 
 using k8s;
 using k8s.Models;
+using System.Threading;
+using System.Threading.Channels;
 
 namespace KubernetesClient.Informer.Client;
 
@@ -10,22 +12,23 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
 {
     internal class Registration : IResourceInformerRegistration
     {
-        private bool _disposedValue;
+        private readonly Channel<Notification> _notifications = Channel.CreateUnbounded<Notification>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+        });
+        private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _initialDelivery = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly bool _waitForInformerSync;
+        private int _disposedValue;
 
-        public Registration(ResourceInformer<TResource> resourceInformer, ResourceInformerCallback<TResource> callback)
+        private readonly record struct Notification(WatchEventType? EventType, TResource? Resource, bool IsReadyMarker);
+
+        public Registration(ResourceInformer<TResource> resourceInformer, ResourceInformerCallback<TResource> callback, bool waitForInformerSync)
         {
             ResourceInformer = resourceInformer;
             Callback = callback;
-            lock (resourceInformer._sync)
-            {
-                ObjectDisposedException.ThrowIf(resourceInformer._disposed, resourceInformer);
-                if (resourceInformer._initialListStarted)
-                {
-                    throw new InvalidOperationException("Resource callbacks must be registered before the initial list starts.");
-                }
-
-                resourceInformer._registrations = resourceInformer._registrations.Add(this);
-            }
+            _waitForInformerSync = waitForInformerSync;
         }
 
         ~Registration()
@@ -36,18 +39,91 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
 
         public ResourceInformer<TResource> ResourceInformer { get; }
         public ResourceInformerCallback<TResource> Callback { get; }
+        internal Task InitialDeliveryTask => _initialDelivery.Task;
 
-        public Task ReadyAsync(CancellationToken cancellationToken) => ResourceInformer.ReadyAsync(cancellationToken);
+        internal void Start()
+        {
+            _ = Task.Run(ProcessNotificationsAsync);
+        }
+
+        internal void Enqueue(WatchEventType eventType, TResource resource)
+            => _notifications.Writer.TryWrite(new Notification(eventType, resource, IsReadyMarker: false));
+
+        internal void EnqueueReady()
+            => _notifications.Writer.TryWrite(new Notification(EventType: null, Resource: null, IsReadyMarker: true));
+
+        internal void Complete()
+        {
+            EnqueueReady();
+            _notifications.Writer.TryComplete();
+        }
+
+        private async Task ProcessNotificationsAsync()
+        {
+            try
+            {
+                await foreach (var notification in _notifications.Reader.ReadAllAsync().ConfigureAwait(false))
+                {
+                    if (notification.IsReadyMarker)
+                    {
+                        _ready.TrySetResult();
+                        _initialDelivery.TrySetResult();
+                        continue;
+                    }
+
+                    try
+                    {
+                        Callback.Invoke(notification.EventType!.Value, notification.Resource!);
+                    }
+                    catch (Exception error)
+                    {
+                        // Remove the failing callback before logging so a slow logger cannot leave
+                        // the failed registration eligible for additional watch notifications.
+                        Dispose();
+                        ResourceInformer.ReportCallbackFailure(error);
+                        _ready.TrySetException(error);
+                        _initialDelivery.TrySetResult();
+                        while (_notifications.Reader.TryRead(out _))
+                        {
+                        }
+
+                        return;
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                ResourceInformer.ReportCallbackFailure(error);
+                _ready.TrySetException(error);
+                _initialDelivery.TrySetResult();
+                Dispose();
+            }
+            finally
+            {
+                _ready.TrySetResult();
+                _initialDelivery.TrySetResult();
+            }
+        }
+
+        public async Task ReadyAsync(CancellationToken cancellationToken)
+        {
+            if (_waitForInformerSync)
+            {
+                await ResourceInformer.ReadyAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await _ready.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         protected virtual void Dispose(bool disposing)
         {
-            if (!_disposedValue)
+            if (Interlocked.Exchange(ref _disposedValue, 1) == 0)
             {
                 lock (ResourceInformer._sync)
                 {
                     ResourceInformer._registrations = ResourceInformer._registrations.Remove(this);
+                    Complete();
                 }
-                _disposedValue = true;
             }
         }
 

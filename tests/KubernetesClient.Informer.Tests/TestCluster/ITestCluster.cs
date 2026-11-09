@@ -14,6 +14,8 @@ public interface ITestCluster
 
     Task<ListResult> ListResourcesAsync(string group, string version, string plural, ListParameters parameters);
 
+    void EnqueueListResponse(ListResult response);
+
     ListParameters? LastListParameters { get; }
 
     IList<ListParameters> ListRequests { get; }
@@ -24,5 +26,9 @@ public interface ITestCluster
 
     Task<ListParameters> WatchRequested { get; }
 
+    Task<ListParameters> WaitForWatchRequestAsync(int requestNumber);
+
     IList<WatchEvent> WatchEvents { get; }
+
+    Task? WatchResponseGate { get; set; }
 }

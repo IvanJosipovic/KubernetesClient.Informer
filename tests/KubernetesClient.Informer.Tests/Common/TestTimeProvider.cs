@@ -22,11 +22,22 @@ namespace KubernetesClient.Informer.Common;
 /// </remarks>
 public class TestTimeProvider : TimeProvider
 {
+    private readonly object _sync = new();
     private readonly List<TestTimer> _timers = new();
+    private readonly List<(int Count, TaskCompletionSource Completion)> _timerWaiters = new();
 
     private TimeSpan _currentTime;
 
-    public int TimerCount => _timers.Count;
+    public int TimerCount
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _timers.Count;
+            }
+        }
+    }
 
     // Mess with the frequency to check for bad assumptions in the code.
     public override long TimestampFrequency => TimeSpan.TicksPerSecond * 7;
@@ -51,7 +62,10 @@ public class TestTimeProvider : TimeProvider
     /// <param name="howMuch">How much to advance <see cref="CurrentTime"/> by.</param>
     public void Advance(TimeSpan howMuch)
     {
-        AdvanceTo(_currentTime + howMuch);
+        lock (_sync)
+        {
+            AdvanceTo(_currentTime + howMuch);
+        }
     }
 
     /// <summary>
@@ -60,37 +74,92 @@ public class TestTimeProvider : TimeProvider
     /// <param name="targetTime">Advances <see cref="CurrentTime"/> until it equals <paramref name="targetTime"/>.</param>
     public void AdvanceTo(TimeSpan targetTime)
     {
-        if (targetTime < _currentTime)
+        lock (_sync)
         {
-            throw new InvalidOperationException("Time should not flow backwards");
+            if (targetTime < _currentTime)
+            {
+                throw new InvalidOperationException("Time should not flow backwards");
+            }
+
+            // We could use this to fire timers, but timers are currently fired manually by tests.
+
+            _currentTime = targetTime;
         }
-
-        // We could use this to fire timers, but timers are currently fired manually by tests.
-
-        _currentTime = targetTime;
     }
 
-    public override DateTimeOffset GetUtcNow() => new DateTime(_currentTime.Ticks, DateTimeKind.Utc);
+    public override DateTimeOffset GetUtcNow()
+    {
+        lock (_sync)
+        {
+            return DateTimeOffset.UnixEpoch + _currentTime;
+        }
+    }
 
     // Mess with the frequency to check for bad assumptions in the code.
-    public override long GetTimestamp() => _currentTime.Ticks * 7;
+    public override long GetTimestamp()
+    {
+        lock (_sync)
+        {
+            return _currentTime.Ticks * 7;
+        }
+    }
 
     public override ITimer CreateTimer(TimerCallback callback, object state, TimeSpan dueTime, TimeSpan period)
     {
-        Assert.Equal(Timeout.InfiniteTimeSpan, period);
         var timer = new TestTimer(callback, state, dueTime, period);
-        _timers.Add(timer);
+        List<TaskCompletionSource> completedWaiters;
+        lock (_sync)
+        {
+            _timers.Add(timer);
+            completedWaiters = _timerWaiters
+                .Where(waiter => waiter.Count <= _timers.Count)
+                .Select(waiter => waiter.Completion)
+                .ToList();
+            _timerWaiters.RemoveAll(waiter => waiter.Count <= _timers.Count);
+        }
+
+        foreach (var waiter in completedWaiters)
+        {
+            waiter.TrySetResult();
+        }
+
         return timer;
+    }
+
+    public Task WaitForTimerCountAsync(int count, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
+
+        Task task;
+        lock (_sync)
+        {
+            if (_timers.Count >= count)
+            {
+                return Task.CompletedTask;
+            }
+
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _timerWaiters.Add((count, completion));
+            task = completion.Task;
+        }
+
+        return task.WaitAsync(cancellationToken);
     }
 
     public void FireTimer(int idx)
     {
-        _timers[idx].Fire();
+        TestTimer timer;
+        lock (_sync)
+        {
+            timer = _timers[idx];
+        }
+
+        timer.Fire();
     }
 
     public void FireAllTimers()
     {
-        for (var i = 0; i < _timers.Count; i++)
+        for (var i = 0; i < TimerCount; i++)
         {
             FireTimer(i);
         }
@@ -98,12 +167,26 @@ public class TestTimeProvider : TimeProvider
 
     public void VerifyTimer(int idx, TimeSpan dueTime)
     {
-        Assert.Equal(dueTime, _timers[idx].DueTime);
+        lock (_sync)
+        {
+            Assert.Equal(dueTime, _timers[idx].DueTime);
+        }
+    }
+
+    public TimeSpan GetTimerDueTime(int idx)
+    {
+        lock (_sync)
+        {
+            return _timers[idx].DueTime;
+        }
     }
 
     public void AssertTimerDisposed(int idx)
     {
-        Assert.True(_timers[idx].IsDisposed);
+        lock (_sync)
+        {
+            Assert.True(_timers[idx].IsDisposed);
+        }
     }
 
     private sealed class TestTimer : ITimer

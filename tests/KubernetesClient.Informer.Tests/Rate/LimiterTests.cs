@@ -1,15 +1,12 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using Polly;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
-using Xunit.Sdk;
 using KubernetesClient.Informer.Common;
 
 namespace KubernetesClient.Informer.Rate.Tests;
@@ -111,105 +108,123 @@ public class LimiterTests
         Assert.Equal(TimeSpan.FromMilliseconds(50), delayHalfAvailable);
     }
 
-    [Fact(Skip = "https://github.com/dotnet/yarp/issues/1357")]
-    public async Task WaitAsyncCausesPauseLikeReserve()
+    [Fact]
+    public async Task WaitAsyncUsesConfiguredVirtualTimeProvider()
     {
-        var limiter = new Limiter(new Limit(10), 5);
+        var timeProvider = new TestTimeProvider(_startTime);
+        var limiter = new Limiter(new Limit(1), 1, timeProvider);
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
-        while (cancellation.IsCancellationRequested == false)
-        {
-            var task = limiter.WaitAsync(cancellation.Token);
-            if (!task.IsCompleted)
-            {
-                await task;
-                break;
-            }
-        }
-
-        var delayOne = new Stopwatch();
-        delayOne.Start();
         await limiter.WaitAsync(cancellation.Token);
-        delayOne.Stop();
+        var waiting = limiter.WaitAsync(cancellation.Token);
+        Assert.False(waiting.IsCompleted);
 
-        var delayTwoMore = new Stopwatch();
-        delayTwoMore.Start();
-        await limiter.WaitAsync(2, cancellation.Token);
-        delayTwoMore.Stop();
-
-        await Task.Delay(TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
-
-        var delayAlreadyAvailable = new Stopwatch();
-        delayAlreadyAvailable.Start();
-        await limiter.WaitAsync(cancellation.Token);
-        delayAlreadyAvailable.Stop();
-
-        var delayHalfAvailable = new Stopwatch();
-        delayHalfAvailable.Start();
-        await limiter.WaitAsync(cancellation.Token);
-        delayHalfAvailable.Stop();
-
-        Assert.InRange(delayOne.Elapsed, TimeSpan.FromMilliseconds(75), TimeSpan.FromMilliseconds(125));
-        Assert.InRange(delayTwoMore.Elapsed, TimeSpan.FromMilliseconds(175), TimeSpan.FromMilliseconds(225));
-        Assert.InRange(delayAlreadyAvailable.Elapsed, TimeSpan.Zero, TimeSpan.FromMilliseconds(5));
-        Assert.InRange(delayHalfAvailable.Elapsed, TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(75));
+        await timeProvider.WaitForTimerCountAsync(1, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(0, TimeSpan.FromSeconds(1));
+        timeProvider.Advance(TimeSpan.FromSeconds(1));
+        timeProvider.FireTimer(0);
+        await waiting.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
-    [Fact(Skip = "https://github.com/dotnet/yarp/issues/1357")]
+    [Fact]
+    public async Task WaitAsyncCausesPauseLikeReserve()
+    {
+        var timeProvider = new TestTimeProvider(_startTime);
+        var limiter = new Limiter(new Limit(10), 5, timeProvider);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        await ConsumeBurstAndWaitForRefillAsync(limiter, timeProvider, cancellation.Token);
+
+        var delayOne = limiter.WaitAsync(cancellation.Token);
+        await timeProvider.WaitForTimerCountAsync(2, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(1, TimeSpan.FromMilliseconds(100));
+        timeProvider.Advance(TimeSpan.FromMilliseconds(100));
+        timeProvider.FireTimer(1);
+        await delayOne;
+
+        var delayTwoMore = limiter.WaitAsync(2, cancellation.Token);
+        await timeProvider.WaitForTimerCountAsync(3, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(2, TimeSpan.FromMilliseconds(200));
+        timeProvider.Advance(TimeSpan.FromMilliseconds(200));
+        timeProvider.FireTimer(2);
+        await delayTwoMore;
+
+        timeProvider.Advance(TimeSpan.FromMilliseconds(150));
+        var delayAlreadyAvailable = limiter.WaitAsync(cancellation.Token);
+        Assert.True(delayAlreadyAvailable.IsCompletedSuccessfully);
+        await delayAlreadyAvailable;
+
+        var delayHalfAvailable = limiter.WaitAsync(cancellation.Token);
+        await timeProvider.WaitForTimerCountAsync(4, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(3, TimeSpan.FromMilliseconds(50));
+        timeProvider.Advance(TimeSpan.FromMilliseconds(50));
+        timeProvider.FireTimer(3);
+        await delayHalfAvailable;
+    }
+
+    [Fact]
     public async Task ManyWaitsStackUp()
     {
-        await Policy
-            .Handle<InRangeException>()
-            .RetryAsync(3)
-            .ExecuteAsync(async () =>
-            {
-                var limiter = new Limiter(new Limit(10), 5);
-                using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var timeProvider = new TestTimeProvider(_startTime);
+        var limiter = new Limiter(new Limit(10), 5, timeProvider);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
-                while (cancellation.IsCancellationRequested == false)
-                {
-                    var task = limiter.WaitAsync(cancellation.Token);
-                    if (!task.IsCompleted)
-                    {
-                        await task;
-                        break;
-                    }
-                }
+        await ConsumeBurstAndWaitForRefillAsync(limiter, timeProvider, cancellation.Token);
 
-                var delayOne = new Stopwatch();
-                delayOne.Start();
+        var waits = new[]
+        {
+            limiter.WaitAsync(cancellation.Token),
+            limiter.WaitAsync(cancellation.Token),
+            limiter.WaitAsync(cancellation.Token),
+        };
+        await timeProvider.WaitForTimerCountAsync(4, cancellation.Token).DefaultTimeout();
 
-                var delayTwo = new Stopwatch();
-                delayTwo.Start();
+        timeProvider.VerifyTimer(1, TimeSpan.FromMilliseconds(100));
+        timeProvider.VerifyTimer(2, TimeSpan.FromMilliseconds(100));
+        timeProvider.VerifyTimer(3, TimeSpan.FromMilliseconds(100));
 
-                var delayThree = new Stopwatch();
-                delayThree.Start();
+        timeProvider.Advance(TimeSpan.FromMilliseconds(100));
+        timeProvider.FireTimer(1);
+        Assert.Same(waits[0], await Task.WhenAny(waits));
+        await waits[0];
+        Assert.False(waits[1].IsCompleted);
+        Assert.False(waits[2].IsCompleted);
 
-                var waits = new List<Task>
-                {
-                    limiter.WaitAsync(cancellation.Token),
-                    limiter.WaitAsync(cancellation.Token),
-                    limiter.WaitAsync(cancellation.Token),
-                };
+        timeProvider.FireTimer(2);
+        await timeProvider.WaitForTimerCountAsync(5, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(4, TimeSpan.FromMilliseconds(100));
+        timeProvider.FireTimer(3);
+        await timeProvider.WaitForTimerCountAsync(6, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(5, TimeSpan.FromMilliseconds(100));
 
-                var taskOne = await Task.WhenAny(waits);
-                await taskOne;
-                delayOne.Stop();
-                waits.Remove(taskOne);
+        timeProvider.Advance(TimeSpan.FromMilliseconds(100));
+        timeProvider.FireTimer(4);
+        await waits[1];
+        Assert.False(waits[2].IsCompleted);
 
-                var taskTwo = await Task.WhenAny(waits);
-                await taskTwo;
-                delayTwo.Stop();
-                waits.Remove(taskTwo);
+        timeProvider.FireTimer(5);
+        await timeProvider.WaitForTimerCountAsync(7, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(6, TimeSpan.FromMilliseconds(100));
+        timeProvider.Advance(TimeSpan.FromMilliseconds(100));
+        timeProvider.FireTimer(6);
+        await waits[2];
+    }
 
-                var taskThree = await Task.WhenAny(waits);
-                await taskThree;
-                delayThree.Stop();
-                waits.Remove(taskThree);
+    private static async Task ConsumeBurstAndWaitForRefillAsync(
+        Limiter limiter,
+        TestTimeProvider timeProvider,
+        CancellationToken cancellationToken)
+    {
+        for (var i = 0; i < 5; i++)
+        {
+            await limiter.WaitAsync(cancellationToken);
+        }
 
-                Assert.InRange(delayOne.Elapsed, TimeSpan.FromMilliseconds(75), TimeSpan.FromMilliseconds(125));
-                Assert.InRange(delayTwo.Elapsed, TimeSpan.FromMilliseconds(175), TimeSpan.FromMilliseconds(225));
-                Assert.InRange(delayThree.Elapsed, TimeSpan.FromMilliseconds(275), TimeSpan.FromMilliseconds(325));
-            });
+        var waitForRefill = limiter.WaitAsync(cancellationToken);
+        await timeProvider.WaitForTimerCountAsync(1, cancellationToken).DefaultTimeout();
+        timeProvider.VerifyTimer(0, TimeSpan.FromMilliseconds(100));
+        timeProvider.Advance(TimeSpan.FromMilliseconds(100));
+        timeProvider.FireTimer(0);
+        await waitForRefill;
     }
 }

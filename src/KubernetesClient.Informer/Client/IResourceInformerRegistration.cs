@@ -14,11 +14,20 @@ namespace KubernetesClient.Informer.Client;
 public interface IResourceInformerRegistration : IDisposable
 {
     /// <summary>
-    /// Returns a task that can be awaited to know when the initial listing of resources is complete.
-    /// Once an await on this method is completed it is safe to assume that all the knowledge of this resource
-    /// type has been made available. Any new changes will be a result of receiving new updates.
+    /// Returns a task that completes after this registration has received the initial list, or, for a late
+    /// registration, after it has received the current cache as Added notifications. Those notifications are
+    /// queued by Register and delivered asynchronously. If a callback throws during initial delivery, this task
+    /// faults and the registration is removed; the informer and other registrations continue.
     /// </summary>
     /// <param name="cancellationToken">The cancellation token that can be used by other objects or threads to receive notice of cancellation.</param>
     /// <returns>Task.</returns>
     Task ReadyAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Stops this registration from receiving newly enqueued notifications.
+    /// Notifications already queued are delivered in order when their callbacks complete normally;
+    /// consequently, a queued callback may run after this method returns.
+    /// </summary>
+    /// <remarks>A callback already in progress is not interrupted.</remarks>
+    new void Dispose();
 }

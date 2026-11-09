@@ -18,6 +18,10 @@ public class TestCluster : ITestCluster
 
     private readonly TaskCompletionSource<ListParameters> _listRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<ListParameters> _watchRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _watchRequestSync = new();
+    private readonly Dictionary<int, TaskCompletionSource<ListParameters>> _watchRequestWaiters = new();
+    private readonly object _listResponseSync = new();
+    private readonly Queue<ListResult> _listResponses = new();
 
     public ListParameters? LastListParameters { get; private set; }
 
@@ -29,7 +33,30 @@ public class TestCluster : ITestCluster
 
     public Task<ListParameters> WatchRequested => _watchRequested.Task;
 
+    public Task<ListParameters> WaitForWatchRequestAsync(int requestNumber)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(requestNumber);
+
+        lock (_watchRequestSync)
+        {
+            if (WatchRequests.Count >= requestNumber)
+            {
+                return Task.FromResult(WatchRequests[requestNumber - 1]);
+            }
+
+            if (!_watchRequestWaiters.TryGetValue(requestNumber, out var waiter))
+            {
+                waiter = new TaskCompletionSource<ListParameters>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _watchRequestWaiters.Add(requestNumber, waiter);
+            }
+
+            return waiter.Task;
+        }
+    }
+
     public IList<WatchEvent> WatchEvents { get; } = new List<WatchEvent>();
+
+    public Task? WatchResponseGate { get; set; }
 
     public TestCluster(IOptions<TestClusterOptions> options)
     {
@@ -38,6 +65,15 @@ public class TestCluster : ITestCluster
         foreach (var resource in options.Value.InitialResources)
         {
             Resources.Add(ResourceSerializers.Convert<ResourceObject>(resource));
+        }
+    }
+
+    public void EnqueueListResponse(ListResult response)
+    {
+        ArgumentNullException.ThrowIfNull(response);
+        lock (_listResponseSync)
+        {
+            _listResponses.Enqueue(response);
         }
     }
 
@@ -55,13 +91,31 @@ public class TestCluster : ITestCluster
         LastListParameters = parameters;
         if (parameters.Watch == true)
         {
-            WatchRequests.Add(parameters);
-            _watchRequested.TrySetResult(parameters);
+            lock (_watchRequestSync)
+            {
+                WatchRequests.Add(parameters);
+                _watchRequested.TrySetResult(parameters);
+                if (_watchRequestWaiters.Remove(WatchRequests.Count, out var waiter))
+                {
+                    waiter.TrySetResult(parameters);
+                }
+            }
         }
         else
         {
             ListRequests.Add(parameters);
             _listRequested.TrySetResult(parameters);
+        }
+
+        if (parameters.Watch != true)
+        {
+            lock (_listResponseSync)
+            {
+                if (_listResponses.TryDequeue(out var response))
+                {
+                    return Task.FromResult(response);
+                }
+            }
         }
 
         return Task.FromResult(new ListResult

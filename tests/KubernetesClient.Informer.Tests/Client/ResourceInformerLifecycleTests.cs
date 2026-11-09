@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
+using KubernetesClient.Informer.Common;
 
 namespace KubernetesClient.Informer.Client.Tests;
 
@@ -31,7 +32,6 @@ public class ResourceInformerLifecycleTests
         using var cancellation = new CancellationTokenSource();
         var runTask = informer.RunAsync(cancellation.Token);
 
-        await Task.Delay(TimeSpan.FromMilliseconds(100));
         Assert.False(runTask.IsCompleted);
 
         cancellation.Cancel();
@@ -53,6 +53,22 @@ public class ResourceInformerLifecycleTests
             () => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task RegistrationAfterRunStopsBeforeInitialSyncCannotBecomeReady()
+    {
+        using var informer = CreateInformer();
+        using var cancellation = new CancellationTokenSource();
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((_, _) => { }));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => registration.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
     [Fact]
@@ -120,6 +136,26 @@ public class ResourceInformerLifecycleTests
     }
 
     [Fact]
+    public void RegistrationCanBeDisposedMoreThanOnce()
+    {
+        using var informer = CreateInformer();
+        var registration = informer.Register((ResourceInformerCallback<V1Pod>)((_, _) => { }));
+
+        registration.Dispose();
+        registration.Dispose();
+    }
+
+    [Fact]
+    public void RegisterAfterInformerDisposalThrows()
+    {
+        using var informer = CreateInformer();
+        informer.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(
+            () => informer.Register((ResourceInformerCallback<V1Pod>)((_, _) => { })));
+    }
+
+    [Fact]
     public async Task DisposeDoesNotInvalidateReadinessSignal()
     {
         using var informer = CreateInformer();
@@ -159,6 +195,73 @@ public class ResourceInformerLifecycleTests
         Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
     }
 
+    [Fact]
+    public async Task RunInfiniteRetriesUnexpectedRunFailureAfterBackoff()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var timeProvider = new TestTimeProvider();
+        using var informer = new RetryOnceInformer(timeProvider);
+
+        var runTask = informer.RunInfinite(cancellation.Token);
+        await timeProvider.WaitForTimerCountAsync(1, cancellation.Token).DefaultTimeout();
+
+        var backoff = timeProvider.GetTimerDueTime(0);
+        Assert.InRange(backoff, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(1500));
+        timeProvider.FireTimer(0);
+        await informer.SecondRunStarted.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        cancellation.Cancel();
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, informer.RunCount);
+        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
+    }
+
+    [Fact]
+    public async Task RunInfiniteWithPreCanceledTokenDoesNotStartRunAsync()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        using var informer = new CancellationAwareInformer();
+
+        await informer.RunInfinite(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(0, informer.RunCount);
+        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task ConcurrentRunInfiniteCallsAreRejected()
+    {
+        using var cancellation = new CancellationTokenSource();
+        using var informer = new CancellationAwareInformer();
+        var runTask = informer.RunInfinite(cancellation.Token);
+        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => informer.RunInfinite(CancellationToken.None));
+
+        cancellation.Cancel();
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, informer.RunCount);
+    }
+
+    [Fact]
+    public async Task RunInfiniteIsRejectedWhileRunAsyncIsActive()
+    {
+        using var cancellation = new CancellationTokenSource();
+        using var informer = CreateInformer();
+        var runTask = informer.RunAsync(cancellation.Token);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => informer.RunInfinite(CancellationToken.None));
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
     private static ResourceInformer<V1Pod> CreateInformer()
     {
         return new ResourceInformer<V1Pod>(
@@ -188,6 +291,35 @@ public class ResourceInformerLifecycleTests
             RunCount++;
             ObservedToken = cancellationToken;
             TokenObserved.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+    }
+
+    private sealed class RetryOnceInformer : ResourceInformer<V1Pod>
+    {
+        private int _runCount;
+
+        public RetryOnceInformer(TimeProvider timeProvider)
+            : base(
+                new Mock<IKubernetes>().Object,
+                new Mock<IHostApplicationLifetime>().Object,
+                NullLogger<ResourceInformer<V1Pod>>.Instance,
+                timeProvider: timeProvider)
+        {
+        }
+
+        public int RunCount => Volatile.Read(ref _runCount);
+
+        public TaskCompletionSource SecondRunStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async Task RunAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _runCount) == 1)
+            {
+                throw new InvalidOperationException("Initial connection failed.");
+            }
+
+            SecondRunStarted.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
         }
     }

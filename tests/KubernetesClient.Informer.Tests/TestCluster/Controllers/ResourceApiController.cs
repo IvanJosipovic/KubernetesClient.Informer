@@ -33,6 +33,11 @@ public class ResourceApiController : ControllerBase
         if (parameters.Watch == true)
         {
             await _testCluster.ListResourcesAsync(string.Empty, Version, Plural, parameters);
+            if (_testCluster.WatchResponseGate is { } watchResponseGate)
+            {
+                await watchResponseGate.WaitAsync(HttpContext.RequestAborted);
+            }
+
             Response.ContentType = "application/json";
             foreach (var watchEvent in _testCluster.WatchEvents.ToArray())
             {

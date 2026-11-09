@@ -38,11 +38,13 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private Dictionary<NamespacedName, TResource> _cache = [];
     private string? _lastResourceVersion;
     private readonly string? _namespace;
+    private readonly TimeProvider _timeProvider;
     private int _status = (int)ResourceInformerStatus.NotStarted;
     private int? _timeoutSeconds;
     private readonly int _resourceListLimit;
     private bool _disposed;
-    private bool _initialListStarted;
+    private bool _initialListCompleted;
+    private bool _lastResourceVersionUnavailable;
     private int _runActive;
     private int _runInfiniteActive;
     private readonly AsyncLocal<bool> _runInfiniteInvocation = new();
@@ -78,6 +80,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <param name="timeoutSeconds">The timeout in seconds for list and watch operations.</param>
     /// <param name="resourceListLimit">The maximum number of resources to request in each list page.</param>
     /// <param name="groupApiVersionKind">The resource group, API version, kind, and plural name to use when accessing the Kubernetes API.</param>
+    /// <param name="timeProvider">The time provider used for retry delays and watch timeouts.</param>
     public ResourceInformer(
         IKubernetes client,
         IHostApplicationLifetime hostApplicationLifetime,
@@ -86,7 +89,8 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         string? @namespace = null,
         int resourceListLimit = 1000,
         int? timeoutSeconds = null,
-        GroupApiVersionKind? groupApiVersionKind = null)
+        GroupApiVersionKind? groupApiVersionKind = null,
+        TimeProvider? timeProvider = null)
         : base(hostApplicationLifetime, logger)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -98,6 +102,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         _groupApiVersionKind = groupApiVersionKind ?? GroupApiVersionKind.From<TResource>();
         _timeoutSeconds = timeoutSeconds;
         _resourceListLimit = resourceListLimit;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     private enum EventType
@@ -126,6 +131,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 if (!_disposed)
                 {
                     _disposed = true;
+                    foreach (var registration in _registrations)
+                    {
+                        registration.Complete();
+                    }
+
                     _registrations = [];
                 }
             }
@@ -155,7 +165,27 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     {
         ArgumentNullException.ThrowIfNull(callback);
 
-        return new Registration(this, callback);
+        Registration registration;
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            registration = new Registration(this, callback, waitForInformerSync: !_initialListCompleted);
+            _registrations = _registrations.Add(registration);
+
+            if (_initialListCompleted)
+            {
+                foreach (var resource in _cache.Values)
+                {
+                    registration.Enqueue(WatchEventType.Added, resource);
+                }
+
+                registration.EnqueueReady();
+            }
+
+            registration.Start();
+        }
+
+        return registration;
     }
 
     /// <inheritdoc/>
@@ -163,7 +193,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     {
         ArgumentNullException.ThrowIfNull(callback);
 
-        return new Registration(this, (eventType, resource) => callback(eventType, resource));
+        return Register((ResourceInformerCallback<TResource>)((eventType, resource) => callback(eventType, resource)));
     }
 
     /// <inheritdoc/>
@@ -276,18 +306,18 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                         _runInfiniteInvocation.Value = false;
                     }
                 }
-                catch (Exception error) when (!cancellationToken.IsCancellationRequested && IsRetryable(error))
+                catch (Exception error) when (!cancellationToken.IsCancellationRequested && error is not OperationCanceledException)
                 {
                     Status = ResourceInformerStatus.Retrying;
-                    var retryDelay = GetRetryDelay(error, retryAttempt++);
+                    var retryDelay = GetRetryDelay(error, retryAttempt++, _timeProvider);
 
                     Logger.LogWarning(
                         EventId(EventType.WatchingRetryScheduled),
-                        "Retrying {ResourceType} in {RetryDelay} after a transient failure.",
+                        "Retrying {ResourceType} in {RetryDelay} after a failure.",
                         typeof(TResource).Name,
                         retryDelay);
 
-                    await Task.Delay(retryDelay, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(retryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -317,7 +347,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private async Task RunListWatchAsync(CancellationToken cancellationToken)
     {
-        var limiter = new Limiter(new Limit(0.2), 3);
+        var limiter = new Limiter(new Limit(0.2), 3, _timeProvider);
         var shouldSync = true;
         var firstSync = true;
         var retryAttempt = 0;
@@ -328,11 +358,6 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             {
                 if (shouldSync)
                 {
-                    lock (_sync)
-                    {
-                        _initialListStarted = true;
-                    }
-
                     await ListAsync(cancellationToken).ConfigureAwait(true);
                     shouldSync = false;
                 }
@@ -369,7 +394,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
             }
-            catch (HttpOperationException ex) when (IsRetryable(ex))
+            catch (HttpOperationException ex)
             {
                 LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
@@ -382,7 +407,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
             }
-            catch (KubernetesException ex) when (IsRetryable(ex))
+            catch (KubernetesException ex)
             {
                 LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
@@ -393,6 +418,13 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                     shouldSync = true;
                 }
 
+                await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                LogWatchError(ex);
+                Status = ResourceInformerStatus.Retrying;
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
             }
@@ -409,7 +441,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         InformerDiagnostics.RecordException(Activity.Current, error);
         Logger.LogDebug(
             EventId(EventType.ReceivedError),
-            "Received error watching {ResourceType}: {ErrorMessage}",
+            "Received error during list/watch for {ResourceType}: {ErrorMessage}",
             typeof(TResource).Name,
             error);
     }
@@ -421,42 +453,29 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private static bool IsExpiredResourceVersion(HttpOperationException exception)
         => exception.Response?.StatusCode == HttpStatusCode.Gone;
 
-    private static bool IsRetryable(Exception exception)
-        => exception switch
-        {
-            TaskCanceledException => true,
-            HttpRequestException => true,
-            HttpOperationException httpOperationException => IsRetryableHttpStatus(httpOperationException.Response?.StatusCode),
-            KubernetesException kubernetesException => IsRetryableKubernetesStatus(kubernetesException.Status),
-            IOException { InnerException: SocketException } => true,
-            _ => false,
-        };
-
-    private static bool IsRetryableKubernetesStatus(V1Status? status)
+    private string? GetListResourceVersion()
     {
-        if (status is null)
+        lock (_sync)
         {
-            return true;
-        }
+            if (_lastResourceVersionUnavailable)
+            {
+                return null;
+            }
 
-        if (status.Code is { } code)
-        {
-            return IsRetryableHttpStatus((HttpStatusCode)code);
+            // Match client-go: start at the watch cache, then relist from the last observed version.
+            return string.IsNullOrEmpty(_lastResourceVersion) ? "0" : _lastResourceVersion;
         }
-
-        return string.Equals(status.Reason, "Expired", StringComparison.Ordinal)
-            || string.Equals(status.Reason, "Timeout", StringComparison.Ordinal)
-            || string.Equals(status.Reason, "ServerTimeout", StringComparison.Ordinal)
-            || string.Equals(status.Reason, "TooManyRequests", StringComparison.Ordinal)
-            || string.Equals(status.Reason, "InternalError", StringComparison.Ordinal)
-            || string.Equals(status.Reason, "ServiceUnavailable", StringComparison.Ordinal);
     }
 
-    private static bool IsRetryableHttpStatus(HttpStatusCode? statusCode)
-        => statusCode is HttpStatusCode.Gone or HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests
-            || statusCode is { } code && (int)code is >= 500 and <= 599;
+    private void MarkListResourceVersionUnavailable()
+    {
+        lock (_sync)
+        {
+            _lastResourceVersionUnavailable = true;
+        }
+    }
 
-    private static TimeSpan GetRetryDelay(Exception exception, int attempt)
+    private static TimeSpan GetRetryDelay(Exception exception, int attempt, TimeProvider timeProvider)
     {
         const double initialSeconds = 1;
         const double maximumBackoffSeconds = 60;
@@ -464,7 +483,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         var backoffSeconds = Math.Min(initialSeconds * Math.Pow(2, Math.Min(attempt, 6)), maximumBackoffSeconds);
         var jitteredBackoff = TimeSpan.FromSeconds(backoffSeconds * (0.5 + Random.Shared.NextDouble()));
-        var retryAfter = GetRetryAfter(exception);
+        var retryAfter = GetRetryAfter(exception, timeProvider);
 
         if (retryAfter is null || retryAfter <= jitteredBackoff)
         {
@@ -476,7 +495,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             : retryAfter.Value;
     }
 
-    private static TimeSpan? GetRetryAfter(Exception exception)
+    private static TimeSpan? GetRetryAfter(Exception exception, TimeProvider timeProvider)
     {
         if (exception is KubernetesException kubernetesException
             && kubernetesException.Status?.Details?.RetryAfterSeconds is { } retryAfterSeconds
@@ -500,15 +519,15 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var retryAt))
         {
-            var delay = retryAt - DateTimeOffset.UtcNow;
+            var delay = retryAt - timeProvider.GetUtcNow();
             return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
         }
 
         return null;
     }
 
-    private static Task WaitBeforeRetryAsync(Exception exception, int attempt, CancellationToken cancellationToken)
-        => Task.Delay(GetRetryDelay(exception, attempt), cancellationToken);
+    private Task WaitBeforeRetryAsync(Exception exception, int attempt, CancellationToken cancellationToken)
+        => Task.Delay(GetRetryDelay(exception, attempt, _timeProvider), _timeProvider, cancellationToken);
 
     private Task<HttpOperationResponse<TResponse>> CreateResponseAsync<TResponse>(bool? watch, int? limit, bool? allowWatchBookmarks, string? continueParameter, string? resourceVersion, CancellationToken cancellationToken)
         where TResponse : class
@@ -550,9 +569,16 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         SetResourceTags(activity);
         activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
 
-        var previousCache = _cache;
+        Dictionary<NamespacedName, TResource> previousCache;
+        lock (_sync)
+        {
+            previousCache = _cache;
+        }
+
         var nextCache = new Dictionary<NamespacedName, TResource>();
         var listedItems = new List<(WatchEventType EventType, TResource Resource)>();
+        ImmutableList<Registration> registrations;
+        var listResourceVersion = GetListResourceVersion();
         string? nextResourceVersion = null;
 
         if (_selector?.FieldSelector is not null)
@@ -578,13 +604,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             cancellationToken.ThrowIfCancellationRequested();
 
             // request next page of items
-            using var listWithHttpMessage = await CreateResponseAsync<KubernetesList<TResource>>(
-                watch: null,
-                limit: _resourceListLimit,
-                allowWatchBookmarks: null,
-                continueParameter: continueParameter,
-                resourceVersion: null,
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            using var listWithHttpMessage = await CreateListResponseAsync(
+                continueParameter,
+                listResourceVersion,
+                cancellationToken).ConfigureAwait(false);
 
             var list = listWithHttpMessage.Body;
             foreach (var item in list.Items)
@@ -613,31 +636,71 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         }
         while (!string.IsNullOrEmpty(continueParameter));
 
-        _cache = nextCache;
-        _lastResourceVersion = nextResourceVersion;
-
-        foreach (var (eventType, resource) in listedItems)
+        lock (_sync)
         {
-            InvokeRegistrationCallbacks(eventType, resource);
-        }
+            _cache = nextCache;
+            _lastResourceVersion = nextResourceVersion;
+            _lastResourceVersionUnavailable = false;
+            _initialListCompleted = true;
+            registrations = _registrations;
 
-        foreach (var (key, item) in previousCache)
-        {
-            if (nextCache.ContainsKey(key))
+            foreach (var (eventType, resource) in listedItems)
             {
-                continue;
+                EnqueueRegistrationCallbacks(registrations, eventType, resource);
             }
 
-            // Reuse the last-known object so delete handlers retain the resource's full state.
-            InvokeRegistrationCallbacks(WatchEventType.Deleted, item);
+            foreach (var (key, item) in previousCache)
+            {
+                if (nextCache.ContainsKey(key))
+                {
+                    continue;
+                }
+
+                // Reuse the last-known object so delete handlers retain the resource's full state.
+                EnqueueRegistrationCallbacks(registrations, WatchEventType.Deleted, item);
+            }
+
+            foreach (var registration in registrations)
+            {
+                registration.EnqueueReady();
+            }
         }
+
+        await Task.WhenAll(registrations.Select(registration => registration.InitialDeliveryTask)).ConfigureAwait(false);
 
         Logger.LogInformation(
             EventId(EventType.SynchronizeComplete),
             "Completed synchronizing {ResourceType} resources from API server.",
             typeof(TResource).Name);
         activity?.SetStatus(ActivityStatusCode.Ok);
-        activity?.SetTag("k8s.informer.resource_count", _cache.Count);
+        activity?.SetTag("k8s.informer.resource_count", nextCache.Count);
+    }
+
+    private async Task<HttpOperationResponse<KubernetesList<TResource>>> CreateListResponseAsync(
+        string? continueParameter,
+        string? resourceVersion,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await CreateResponseAsync<KubernetesList<TResource>>(
+                watch: null,
+                limit: _resourceListLimit,
+                allowWatchBookmarks: null,
+                continueParameter: continueParameter,
+                resourceVersion: resourceVersion,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpOperationException exception) when (IsExpiredResourceVersion(exception))
+        {
+            MarkListResourceVersionUnavailable();
+            throw;
+        }
+        catch (KubernetesException exception) when (IsExpiredResourceVersion(exception))
+        {
+            MarkListResourceVersionUnavailable();
+            throw;
+        }
     }
 
     private async Task WatchAsync(CancellationToken cancellationToken)
@@ -648,14 +711,14 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         Logger.LogInformation(EventId(EventType.WatchingResource), "Watching {ResourceType} starting from resource version {ResourceVersion}.", typeof(TResource).Name, _lastResourceVersion);
 
-        var lastEventUtc = DateTime.UtcNow;
+        var lastEventUtc = _timeProvider.GetUtcNow();
         using var reconnectCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        using var checkLastEventUtcTimer = new Timer(_ =>
+        using var checkLastEventUtcTimer = _timeProvider.CreateTimer(_ =>
         {
-            var lastEvent = DateTime.UtcNow - lastEventUtc;
+            var lastEvent = _timeProvider.GetUtcNow() - lastEventUtc;
             if (lastEvent > TimeSpan.FromMinutes(9.5))
             {
-                lastEventUtc = DateTime.MaxValue;
+                lastEventUtc = DateTimeOffset.MaxValue;
                 Logger.LogDebug(EventId(EventType.DisposingToReconnect), "Disposing watcher for {ResourceType} to cause reconnect.", typeof(TResource).Name);
                 reconnectCancellationTokenSource.Cancel();
             }
@@ -684,7 +747,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 ExceptionDispatchInfo.Capture(e).Throw();
             }, reconnectCancellationTokenSource.Token))
             {
-                lastEventUtc = DateTime.UtcNow;
+                lastEventUtc = _timeProvider.GetUtcNow();
                 OnEvent(eventType, resource);
             }
         }
@@ -712,31 +775,42 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             item.Namespace(),
             item.ResourceVersion());
 
-        if (watchEventType == WatchEventType.Added ||
-            watchEventType == WatchEventType.Modified)
+        ImmutableList<Registration> registrations;
+        lock (_sync)
         {
-            // BUGBUG: log warning if cache was not in expected state
-            _cache[NamespacedName.From(item)] = item;
-        }
+            if (_disposed)
+            {
+                return;
+            }
 
-        if (watchEventType == WatchEventType.Deleted)
-        {
-            _cache.Remove(NamespacedName.From(item));
-        }
+            if (watchEventType == WatchEventType.Added ||
+                watchEventType == WatchEventType.Modified)
+            {
+                // BUGBUG: log warning if cache was not in expected state
+                _cache[NamespacedName.From(item)] = item;
+            }
 
-        if (watchEventType == WatchEventType.Added ||
-            watchEventType == WatchEventType.Modified ||
-            watchEventType == WatchEventType.Deleted ||
-            watchEventType == WatchEventType.Bookmark)
-        {
-            _lastResourceVersion = item.ResourceVersion();
-        }
+            if (watchEventType == WatchEventType.Deleted)
+            {
+                _cache.Remove(NamespacedName.From(item));
+            }
 
-        if (watchEventType == WatchEventType.Added ||
-            watchEventType == WatchEventType.Modified ||
-            watchEventType == WatchEventType.Deleted)
-        {
-            InvokeRegistrationCallbacks(watchEventType, item);
+            if (watchEventType == WatchEventType.Added ||
+                watchEventType == WatchEventType.Modified ||
+                watchEventType == WatchEventType.Deleted ||
+                watchEventType == WatchEventType.Bookmark)
+            {
+                _lastResourceVersion = item.ResourceVersion();
+            }
+
+            registrations = _registrations;
+
+            if (watchEventType == WatchEventType.Added ||
+                watchEventType == WatchEventType.Modified ||
+                watchEventType == WatchEventType.Deleted)
+            {
+                EnqueueRegistrationCallbacks(registrations, watchEventType, item);
+            }
         }
     }
 
@@ -750,37 +824,18 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         activity?.SetTag("k8s.namespace.name", _namespace);
     }
 
-    private void InvokeRegistrationCallbacks(WatchEventType eventType, TResource resource)
+    private static void EnqueueRegistrationCallbacks(ImmutableList<Registration> registrations, WatchEventType eventType, TResource resource)
     {
-        List<Exception>? innerExceptions = default;
-        ImmutableList<Registration> registrations;
-
-        lock (_sync)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            registrations = _registrations;
-        }
-
         foreach (var registration in registrations)
         {
-            try
-            {
-                registration.Callback.Invoke(eventType, resource);
-            }
-            catch (Exception innerException)
-            {
-                innerExceptions ??= [];
-                innerExceptions.Add(innerException);
-            }
-        }
-
-        if (innerExceptions is not null)
-        {
-            throw new AggregateException("One or more exceptions thrown by ResourceInformerCallback.", innerExceptions);
+            registration.Enqueue(eventType, resource);
         }
     }
+
+    private void ReportCallbackFailure(Exception error)
+        => Logger.LogError(
+            EventId(EventType.WatchingFailed),
+            error,
+            "ResourceInformerCallback for {ResourceType} failed; removing its registration.",
+            typeof(TResource).Name);
 }
