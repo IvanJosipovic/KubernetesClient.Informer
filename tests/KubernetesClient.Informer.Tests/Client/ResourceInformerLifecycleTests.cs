@@ -159,7 +159,12 @@ public class ResourceInformerLifecycleTests
     public async Task DisposeDoesNotInvalidateReadinessSignal()
     {
         using var informer = CreateInformer();
+        var readiness = informer.ReadyAsync(CancellationToken.None);
+
+        Assert.False(readiness.IsCompleted);
         informer.Dispose();
+        Assert.False(readiness.IsCompleted);
+
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
 

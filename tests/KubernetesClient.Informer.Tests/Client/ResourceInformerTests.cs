@@ -333,6 +333,7 @@ public class ResourceInformerTests
         await clusterHost.Cluster.ListRequested.WaitAsync(cancellation.Token).DefaultTimeout();
         Assert.Equal("metadata.name=selected-pod", clusterHost.Cluster.ListRequests.Single().FieldSelector);
         await clusterHost.Cluster.WatchRequested.WaitAsync(cancellation.Token).DefaultTimeout();
+        Assert.Equal("metadata.name=selected-pod", clusterHost.Cluster.WatchRequests.Single().FieldSelector);
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
@@ -797,6 +798,50 @@ public class ResourceInformerTests
         Assert.Equal("5", secondWatch.ResourceVersion);
         Assert.Single(clusterHost.Cluster.ListRequests);
         Assert.Equal(0, Volatile.Read(ref callbackCount));
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task WatchEventAdvancesResourceVersionOnReconnectWithoutRelisting()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.WatchEvents.Add(new WatchEvent
+        {
+            Type = "MODIFIED",
+            Object = new ResourceObject
+            {
+                ApiVersion = "v1",
+                Kind = "Pod",
+                Metadata = new V1ObjectMeta { Name = "updated", ResourceVersion = "5" },
+            },
+        });
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var modifiedEvent = new TaskCompletionSource<V1Pod>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+        {
+            if (eventType == WatchEventType.Modified)
+            {
+                modifiedEvent.TrySetResult(pod);
+            }
+        }));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        var secondWatch = await clusterHost.Cluster.WaitForWatchRequestAsync(2)
+            .WaitAsync(cancellation.Token).DefaultTimeout();
+        var modified = await modifiedEvent.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Equal("5", secondWatch.ResourceVersion);
+        Assert.Equal("updated", modified.Name());
+        Assert.Single(clusterHost.Cluster.ListRequests);
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
@@ -1390,6 +1435,103 @@ public class ResourceInformerTests
     }
 
     [Fact]
+    public async Task WatchRetryHonorsRetryAfterHeader()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var timeProvider = new TestTimeProvider();
+        var secondWatchRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var watchRequestCount = 0;
+        var requestedResourceVersions = new List<string?>();
+        var retryException = CreateHttpOperationException(HttpStatusCode.TooManyRequests);
+        retryException.Response!.Headers["Retry-After"] = ["3"];
+
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        SetupPodListRequest(customObjects);
+        SetupPodWatchException(
+            customObjects,
+            retryException,
+            () =>
+            {
+                if (Interlocked.Increment(ref watchRequestCount) == 2)
+                {
+                    secondWatchRequested.TrySetResult();
+                }
+            },
+            requestedResourceVersions);
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            timeProvider: timeProvider);
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await timeProvider.WaitForTimerCountAsync(2, cancellation.Token).DefaultTimeout();
+        timeProvider.VerifyTimer(1, TimeSpan.FromSeconds(3));
+        timeProvider.FireTimer(1);
+        await secondWatchRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Equal(2, watchRequestCount);
+        Assert.Equal(["1", "1"], requestedResourceVersions);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task ListRetryBackoffIncreasesAcrossConsecutiveFailures()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var timeProvider = new TestTimeProvider();
+        var watchRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var listRequestCount = 0;
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        SetupPodListRequest(
+            customObjects,
+            () => Interlocked.Increment(ref listRequestCount),
+            responseFactoryAsync: () => Volatile.Read(ref listRequestCount) switch
+            {
+                <= 3 => Task.FromException<HttpOperationResponse<KubernetesList<V1Pod>>>(
+                    CreateHttpOperationException(HttpStatusCode.InternalServerError)),
+                4 => Task.FromResult(CreateEmptyPodListResponse()),
+                _ => Task.FromException<HttpOperationResponse<KubernetesList<V1Pod>>>(
+                    new InvalidOperationException("Unexpected list request.")),
+            });
+        SetupPodWatchException(customObjects, new HttpRequestException("Stop after retry progression."), () => watchRequested.TrySetResult());
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            timeProvider: timeProvider);
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await timeProvider.WaitForTimerCountAsync(1, cancellation.Token).DefaultTimeout();
+        Assert.InRange(timeProvider.GetTimerDueTime(0), TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(1500));
+        timeProvider.FireTimer(0);
+
+        await timeProvider.WaitForTimerCountAsync(2, cancellation.Token).DefaultTimeout();
+        Assert.InRange(timeProvider.GetTimerDueTime(1), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3));
+        timeProvider.FireTimer(1);
+
+        await timeProvider.WaitForTimerCountAsync(3, cancellation.Token).DefaultTimeout();
+        Assert.InRange(timeProvider.GetTimerDueTime(2), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(6));
+        timeProvider.FireTimer(2);
+        await watchRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Equal(4, listRequestCount);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
     public async Task CallbackExceptionOnLaterWatchEventRemovesOnlyFailingRegistration()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -1428,6 +1570,152 @@ public class ResourceInformerTests
 
         Assert.Equal(["failure"], failingCallbackEvents.ToArray());
         Assert.False(runTask.IsCompleted);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task CallbackIsUnregisteredBeforeSlowFailureLoggingCompletes()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.WatchResponseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        await clusterHost.StartAsync(cancellation.Token);
+
+        var logger = new BlockingCallbackFailureLogger();
+        using var informer = new ResourceInformer<V1Pod>(clusterHost.Client, Mock.Of<IHostApplicationLifetime>(), logger);
+        var failingCallbackCount = 0;
+        var healthyReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var failingRegistration = informer.Register((ResourceInformerCallback<V1Pod>)((_, _) =>
+        {
+            Interlocked.Increment(ref failingCallbackCount);
+            throw new InvalidOperationException("Block while logging callback failure.");
+        }));
+        using var healthyRegistration = informer.Register((ResourceInformerCallback<V1Pod>)((_, pod) =>
+        {
+            if (pod.Name() == "while-logging")
+            {
+                healthyReceived.TrySetResult();
+            }
+        }));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+        await informer.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await failingRegistration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await healthyRegistration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await clusterHost.Cluster.WatchRequested.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        DispatchWatchEvent(informer, WatchEventType.Modified, "first-failure", "1");
+        await logger.LogEntered.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        try
+        {
+            var registrationsField = typeof(ResourceInformer<V1Pod>).GetField("_registrations", BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(registrationsField);
+            var activeRegistrations = ((System.Collections.IEnumerable)registrationsField.GetValue(informer)!).Cast<object>();
+            Assert.DoesNotContain(failingRegistration, activeRegistrations);
+
+            DispatchWatchEvent(informer, WatchEventType.Added, "while-logging", "2");
+            await healthyReceived.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        }
+        finally
+        {
+            logger.ReleaseLog();
+        }
+
+        await logger.LogCompleted.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        Assert.Equal(1, Volatile.Read(ref failingCallbackCount));
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task LateRegistrationCallbackFailureFaultsOnlyItsReadiness()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources([new V1Pod { Metadata = new V1ObjectMeta { Name = "cached" } }])
+            .Build();
+        clusterHost.Cluster.WatchResponseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var healthyReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var healthyRegistration = informer.Register((ResourceInformerCallback<V1Pod>)((_, pod) =>
+        {
+            if (pod.Name() == "after-late-failure")
+            {
+                healthyReceived.TrySetResult();
+            }
+        }));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await informer.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await healthyRegistration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await clusterHost.Cluster.WatchRequested.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        var lateCallbackCount = 0;
+        using var failingRegistration = informer.Register((ResourceInformerCallback<V1Pod>)((_, _) =>
+        {
+            Interlocked.Increment(ref lateCallbackCount);
+            throw new InvalidOperationException("Late cached replay failed.");
+        }));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingRegistration.ReadyAsync(cancellation.Token).DefaultTimeout());
+        Assert.Equal("Late cached replay failed.", error.Message);
+
+        DispatchWatchEvent(informer, WatchEventType.Modified, "after-late-failure", "2");
+        await healthyReceived.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Equal(1, Volatile.Read(ref lateCallbackCount));
+        Assert.False(runTask.IsCompleted);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task CancelingRegistrationReadinessWaitDoesNotCancelTheRegistration()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var readinessCancellation = new CancellationTokenSource();
+        var listRequestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseListRequest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        SetupPodListRequest(
+            customObjects,
+            () => listRequestStarted.TrySetResult(),
+            responseFactoryAsync: async () =>
+            {
+                await releaseListRequest.Task;
+                return CreateEmptyPodListResponse();
+            });
+        SetupPodWatchException(customObjects, new HttpRequestException("Stop after readiness is verified."));
+
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((_, _) => { }));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await listRequestStarted.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        var canceledWait = registration.ReadyAsync(readinessCancellation.Token);
+        readinessCancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceledWait);
+
+        releaseListRequest.TrySetResult();
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
@@ -1762,6 +2050,118 @@ public class ResourceInformerTests
     }
 
     [Fact]
+    public async Task RelistPublishesAddedModifiedAndDeletedReconciliationEvents()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var timeProvider = new TestTimeProvider();
+        var secondListRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var listRequestCount = 0;
+        var oldExisting = new V1Pod
+        {
+            Metadata = new V1ObjectMeta
+            {
+                Name = "existing",
+                NamespaceProperty = "default",
+                ResourceVersion = "1",
+                Labels = new Dictionary<string, string> { ["generation"] = "old" },
+            },
+            Status = new V1PodStatus { Phase = "Pending" },
+        };
+        var removed = new V1Pod
+        {
+            Metadata = new V1ObjectMeta
+            {
+                Name = "removed",
+                NamespaceProperty = "default",
+                ResourceVersion = "1",
+                Labels = new Dictionary<string, string> { ["retained"] = "last-known" },
+            },
+            Status = new V1PodStatus { Phase = "Running" },
+        };
+        var updatedExisting = new V1Pod
+        {
+            Metadata = new V1ObjectMeta
+            {
+                Name = "existing",
+                NamespaceProperty = "default",
+                ResourceVersion = "2",
+                Labels = new Dictionary<string, string> { ["generation"] = "new" },
+            },
+            Status = new V1PodStatus { Phase = "Running" },
+        };
+        var added = new V1Pod
+        {
+            Metadata = new V1ObjectMeta { Name = "added", NamespaceProperty = "default", ResourceVersion = "2" },
+        };
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        SetupPodListRequest(
+            customObjects,
+            () =>
+            {
+                if (Interlocked.Increment(ref listRequestCount) == 2)
+                {
+                    secondListRequested.TrySetResult();
+                }
+            },
+            responseFactory: null,
+            responseFactoryAsync: () => Volatile.Read(ref listRequestCount) switch
+            {
+                1 => Task.FromResult(CreatePodListResponse([oldExisting, removed], "1")),
+                2 => Task.FromResult(CreatePodListResponse([updatedExisting, added], "2")),
+                _ => Task.FromException<HttpOperationResponse<KubernetesList<V1Pod>>>(
+                    new InvalidOperationException("Unexpected list request.")),
+            });
+        SetupPodWatchException(customObjects, CreateHttpOperationException(HttpStatusCode.Gone));
+
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            timeProvider: timeProvider);
+        var received = new ConcurrentQueue<(WatchEventType EventType, V1Pod Resource)>();
+        var allEventsReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbackCount = 0;
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+        {
+            received.Enqueue((eventType, pod));
+            if (Interlocked.Increment(ref callbackCount) == 5)
+            {
+                allEventsReceived.TrySetResult();
+            }
+        }));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        await timeProvider.WaitForTimerCountAsync(2, cancellation.Token).DefaultTimeout();
+        timeProvider.FireTimer(1);
+        await secondListRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        await allEventsReceived.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        var events = received.ToArray();
+        Assert.Equal(
+            [
+                (WatchEventType.Added, "existing"),
+                (WatchEventType.Added, "removed"),
+                (WatchEventType.Modified, "existing"),
+                (WatchEventType.Added, "added"),
+                (WatchEventType.Deleted, "removed"),
+            ],
+            events.Select(item => (item.EventType, item.Resource.Name())).ToArray());
+        Assert.Equal("new", events[2].Resource.Metadata.Labels["generation"]);
+        Assert.Same(removed, events[4].Resource);
+        Assert.Equal("last-known", events[4].Resource.Metadata.Labels["retained"]);
+        Assert.Equal("Running", events[4].Resource.Status.Phase);
+        Assert.Equal(2, listRequestCount);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
     public async Task ExpiredListResourceVersionRetriesWithoutResourceVersion()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -1955,6 +2355,7 @@ public class ResourceInformerTests
         onEvent.Invoke(informer, [WatchEventType.Added, new V1Pod { Metadata = new V1ObjectMeta { Name = "after-dispose" } }]);
 
         Assert.Equal(0, Volatile.Read(ref callbackCount));
+        cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
         await registration.ReadyAsync(CancellationToken.None).DefaultTimeout();
         registration.Dispose();
@@ -2440,5 +2841,36 @@ public class ResourceInformerTests
                 _callbackFailureLogged.TrySetResult();
             }
         }
+    }
+
+    private sealed class BlockingCallbackFailureLogger : ILogger<ResourceInformer<V1Pod>>
+    {
+        private readonly TaskCompletionSource _releaseLog = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource LogEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource LogCompleted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == LogLevel.Error
+                && exception is InvalidOperationException { Message: "Block while logging callback failure." })
+            {
+                LogEntered.TrySetResult();
+                _releaseLog.Task.GetAwaiter().GetResult();
+                LogCompleted.TrySetResult();
+            }
+        }
+
+        public void ReleaseLog() => _releaseLog.TrySetResult();
     }
 }
