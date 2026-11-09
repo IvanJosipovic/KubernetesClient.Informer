@@ -17,6 +17,11 @@ namespace KubernetesClient.Informer.Client;
 /// <typeparam name="TResource">The type of <see cref="IKubernetesObject{V1ObjectMeta}"/> being monitored.</typeparam>
 /// <param name="eventType">The type of change event which was received.</param>
 /// <param name="resource">The instance of the resource which was received.</param>
+/// <remarks>
+/// Callbacks run synchronously on the informer processing path; keep them short and non-blocking. An unhandled
+/// callback exception faults the informer. A deletion caused by relisting supplies the last object observed by
+/// this informer, while a watch deletion supplies the object from the watch event.
+/// </remarks>
 public delegate void ResourceInformerCallback<TResource>(WatchEventType eventType, TResource resource) where TResource : class, IKubernetesObject<V1ObjectMeta>;
 
 /// <summary>
@@ -33,8 +38,9 @@ public interface IResourceInformer<TResource> : IHostedService, IResourceInforme
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
     /// <summary>
-    /// Registers a callback for change notification. To ensure no events are missed the registration
-    /// may be created in the constructor of a dependant <see cref="IHostedService"/>. The returned
+    /// Registers a callback for change notification. Registration must happen before the informer's initial
+    /// list begins; a later registration is rejected because it would otherwise miss the initial resource state.
+    /// The registration may be created in the constructor of a dependant <see cref="IHostedService"/>. The returned
     /// registration should be disposed when the receiver is ending its work.
     /// </summary>
     /// <param name="callback">The delegate that is invoked with each resource notification.</param>
@@ -42,7 +48,7 @@ public interface IResourceInformer<TResource> : IHostedService, IResourceInforme
     IResourceInformerRegistration Register(ResourceInformerCallback<TResource> callback);
 
     /// <summary>
-    /// Runs the informer indefinitely until the provided cancellation token is cancelled. This method is intended to be used in scenarios where the informer needs to be run outside of a hosted service context, such as in a console application or as part of a long-running process. The method will block until the cancellation token is triggered, at which point it will gracefully shut down the informer and release any resources it holds.
+    /// Runs the informer indefinitely until the provided cancellation token is cancelled. This method is intended to be used instead of host-managed running, such as in a console application or as part of a long-running process; only one run mode may be active at a time. The method will block until cancellation, then stop the informer.
     /// </summary>
     /// <param name="cancellationToken">The cancellation token that can be used to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
@@ -63,17 +69,19 @@ public interface IResourceInformer
     void StartWatching();
 
     /// <summary>
-    /// Returns a task that can be awaited to know when the initial listing of resources is complete.
-    /// Once an await on this method is completed it is safe to assume that all the knowledge of this resource
-    /// type has been made available. Any new changes will be a result of receiving new updates.
+    /// Returns a task that can be awaited to know when the initial listing and callback delivery are complete.
+    /// Once this task completes successfully, the initial resource state has been made available and subsequent
+    /// changes will be delivered as updates. If the informer terminates before the initial sync, the task faults
+    /// or is canceled with the run.
     /// </summary>
     /// <param name="cancellationToken">The cancellation token that can be used by other objects or threads to receive notice of cancellation.</param>
     /// <returns>Task.</returns>
     Task ReadyAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// Registers a callback for change notification. To ensure no events are missed the registration
-    /// may be created in the constructor of a dependant <see cref="IHostedService"/>. The returned
+    /// Registers a callback for change notification. Registration must happen before the informer's initial
+    /// list begins; a later registration is rejected because it would otherwise miss the initial resource state.
+    /// The registration may be created in the constructor of a dependant <see cref="IHostedService"/>. The returned
     /// registration should be disposed when the receiver is ending its work.
     /// </summary>
     /// <param name="callback">The delegate that is invoked with each resource notification.</param>

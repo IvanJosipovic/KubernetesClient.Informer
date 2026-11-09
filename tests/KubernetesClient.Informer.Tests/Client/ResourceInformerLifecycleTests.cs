@@ -41,6 +41,36 @@ public class ResourceInformerLifecycleTests
     }
 
     [Fact]
+    public async Task RunAsyncCancellationBeforeInitialListTerminatesReadiness()
+    {
+        using var informer = CreateInformer();
+        using var cancellation = new CancellationTokenSource();
+        var runTask = informer.RunAsync(cancellation.Token);
+
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task ConcurrentRunAsyncCallsAreRejected()
+    {
+        using var informer = CreateInformer();
+        using var cancellation = new CancellationTokenSource();
+        var runTask = informer.RunAsync(cancellation.Token);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => informer.RunAsync(CancellationToken.None));
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
     public void RegisterRejectsNullCallback()
     {
         using var informer = CreateInformer();
@@ -126,6 +156,7 @@ public class ResourceInformerLifecycleTests
             () => informer.RunInfinite(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5)));
 
         Assert.False(logger.RetryWasLogged);
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
     }
 
     private static ResourceInformer<V1Pod> CreateInformer()

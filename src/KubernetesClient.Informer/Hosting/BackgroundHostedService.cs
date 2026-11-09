@@ -133,12 +133,12 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
             // signal for the RunAsync call to be completed
             _runCancellation.Cancel();
 
-            // join the result of the RunAsync causality line back into the results of
-            // this StopAsync call. this await statement will not complete until CallRunAsync
-            // method has unwound and returned. if RunAsync completed by throwing an exception
-            // it will be rethrown by this await. rethrown Exceptions will pass through
-            // Hosting and may be caught by Program.Main.
-            await _runTask.ConfigureAwait(false);
+            // Join the run task when it completes, but respect the host's shutdown deadline.
+            // Exceptions from a completed run task still propagate through Hosting.
+            if (_runTask is not null)
+            {
+                await _runTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -146,7 +146,10 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
         }
         finally
         {
-            _runTask = null;
+            if (_runTask?.IsCompleted == true)
+            {
+                _runTask = null;
+            }
         }
     }
 

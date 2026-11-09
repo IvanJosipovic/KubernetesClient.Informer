@@ -74,7 +74,10 @@ public class ResourceInformerTests
         };
     }
 
-    private static void SetupPodListRequest(Mock<ICustomObjectsOperations> customObjects, Action? onRequest = null)
+    private static void SetupPodListRequest(
+        Mock<ICustomObjectsOperations> customObjects,
+        Action? onRequest = null,
+        Func<HttpOperationResponse<KubernetesList<V1Pod>>>? responseFactory = null)
     {
         customObjects
             .Setup(x => x.ListClusterCustomObjectWithHttpMessagesAsync<KubernetesList<V1Pod>>(
@@ -94,8 +97,39 @@ public class ResourceInformerTests
                 It.IsAny<IReadOnlyDictionary<string, IReadOnlyList<string>>>(),
                 It.IsAny<CancellationToken>()))
             .Callback(() => onRequest?.Invoke())
-            .Returns(() => Task.FromResult(CreateEmptyPodListResponse()));
+            .Returns(() => Task.FromResult(responseFactory?.Invoke() ?? CreateEmptyPodListResponse()));
     }
+
+    private static void SetupPodListException(Mock<ICustomObjectsOperations> customObjects, Exception exception)
+    {
+        customObjects
+            .Setup(x => x.ListClusterCustomObjectWithHttpMessagesAsync<KubernetesList<V1Pod>>(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<bool?>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<int?>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<int?>(),
+                It.IsAny<bool?>(),
+                It.IsAny<bool?>(),
+                It.IsAny<IReadOnlyDictionary<string, IReadOnlyList<string>>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(exception);
+    }
+
+    private static HttpOperationResponse<KubernetesList<V1Pod>> CreatePodListResponse(IList<V1Pod> pods)
+        => new()
+        {
+            Body = new KubernetesList<V1Pod>(pods, "v1", V1PodList.KubeKind, new V1ListMeta
+            {
+                ResourceVersion = "1",
+            }),
+        };
 
     private static void SetupPodWatchException(Mock<ICustomObjectsOperations> customObjects, Exception exception, Action? onRequest = null)
     {
@@ -1012,7 +1046,11 @@ public class ResourceInformerTests
                 It.IsAny<bool?>(),
                 It.IsAny<IReadOnlyDictionary<string, IReadOnlyList<string>>>(),
                 It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new KubernetesException(new V1Status { Reason = "Expired" }));
+            .ThrowsAsync(new KubernetesException(new V1Status
+            {
+                Code = (int)HttpStatusCode.Gone,
+                Reason = "Gone",
+            }));
 
         var kubernetes = new Mock<IKubernetes>();
         kubernetes.SetupGet(x => x.CustomObjects).Returns(customObjects.Object);
@@ -1029,6 +1067,48 @@ public class ResourceInformerTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
         Assert.True(listRequestCount >= 2, $"Expected at least 2 list requests, saw {listRequestCount}.");
+    }
+
+    [Fact]
+    public async Task ListRetryHonorsRetryAfterHeader()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var watchRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var listRequestCount = 0;
+        var retryException = CreateHttpOperationException(HttpStatusCode.TooManyRequests);
+        retryException.Response!.Headers["Retry-After"] = ["2"];
+
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        SetupPodListRequest(
+            customObjects,
+            () => Interlocked.Increment(ref listRequestCount),
+            () =>
+            {
+                if (Volatile.Read(ref listRequestCount) == 1)
+                {
+                    throw retryException;
+                }
+
+                return CreateEmptyPodListResponse();
+            });
+        SetupPodWatchException(customObjects, new HttpRequestException("End watch after the list retry."), () => watchRequested.TrySetResult());
+
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var stopwatch = Stopwatch.StartNew();
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await watchRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        Assert.True(stopwatch.Elapsed >= TimeSpan.FromMilliseconds(1800), $"Retry-After was not honored; elapsed {stopwatch.Elapsed}.");
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
     }
 
     [Theory]
@@ -1131,14 +1211,73 @@ public class ResourceInformerTests
         var listRequestCount = 0;
 
         var customObjects = new Mock<ICustomObjectsOperations>();
-        SetupPodListRequest(customObjects, () =>
+        var listedPod = new V1Pod
         {
-            if (Interlocked.Increment(ref listRequestCount) == 2)
+            Metadata = new V1ObjectMeta
             {
-                secondListRequested.TrySetResult();
+                Name = "relisted-pod",
+                NamespaceProperty = "default",
+                Uid = "pod-uid",
+                Labels = new Dictionary<string, string> { ["app"] = "demo" },
+            },
+            Status = new V1PodStatus { Phase = "Running" },
+        };
+        var deletedPod = new TaskCompletionSource<V1Pod>(TaskCreationOptions.RunContinuationsAsynchronously);
+        SetupPodListRequest(
+            customObjects,
+            () =>
+            {
+                if (Interlocked.Increment(ref listRequestCount) == 2)
+                {
+                    secondListRequested.TrySetResult();
+                }
+            },
+            () => Volatile.Read(ref listRequestCount) == 1
+                ? CreatePodListResponse([listedPod])
+                : CreateEmptyPodListResponse());
+        SetupPodWatchException(customObjects, CreateHttpOperationException(HttpStatusCode.Gone));
+
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        using var registration = informer.Register((eventType, pod) =>
+        {
+            if (eventType == WatchEventType.Deleted)
+            {
+                deletedPod.TrySetResult(pod);
             }
         });
-        SetupPodWatchException(customObjects, CreateHttpOperationException(HttpStatusCode.Gone));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await secondListRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        var deleted = await deletedPod.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+        Assert.True(listRequestCount >= 2, $"Expected a relist after HTTP 410, saw {listRequestCount} request(s).");
+        Assert.Same(listedPod, deleted);
+        Assert.Equal("pod-uid", deleted.Metadata.Uid);
+        Assert.Equal("demo", deleted.Metadata.Labels["app"]);
+        Assert.Equal("Running", deleted.Status.Phase);
+    }
+
+    [Fact]
+    public async Task ForbiddenKubernetesStatusFaultsInformerAndTerminatesReadiness()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        var exception = new KubernetesException(new V1Status
+        {
+            Code = (int)HttpStatusCode.Forbidden,
+            Reason = "Forbidden",
+        });
+        SetupPodListException(customObjects, exception);
 
         var kubernetes = new Mock<IKubernetes>();
         kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
@@ -1151,11 +1290,37 @@ public class ResourceInformerTests
         var runTask = informer.RunAsync(cancellation.Token);
         informer.StartWatching();
 
-        await secondListRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
-        cancellation.Cancel();
+        await Assert.ThrowsAsync<KubernetesException>(() => runTask);
+        await Assert.ThrowsAsync<KubernetesException>(() => informer.ReadyAsync(CancellationToken.None));
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
+    }
 
+    [Fact]
+    public async Task RegistrationAfterInitialListStartsIsRejected()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        SetupPodListRequest(customObjects);
+        SetupPodWatchException(customObjects, new HttpRequestException("End watch after initial list."));
+
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        using var initialRegistration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) => { }));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+        await initialRegistration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Throws<InvalidOperationException>(
+            () => informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) => { })));
+
+        cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
-        Assert.True(listRequestCount >= 2, $"Expected a relist after HTTP 410, saw {listRequestCount} request(s).");
     }
 
     [Fact]

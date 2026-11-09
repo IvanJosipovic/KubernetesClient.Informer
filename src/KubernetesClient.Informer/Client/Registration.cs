@@ -19,6 +19,11 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
             lock (resourceInformer._sync)
             {
                 ObjectDisposedException.ThrowIf(resourceInformer._disposed, resourceInformer);
+                if (resourceInformer._initialListStarted)
+                {
+                    throw new InvalidOperationException("Resource callbacks must be registered before the initial list starts.");
+                }
+
                 resourceInformer._registrations = resourceInformer._registrations.Add(this);
             }
         }
