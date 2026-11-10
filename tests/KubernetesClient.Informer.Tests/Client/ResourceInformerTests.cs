@@ -219,6 +219,7 @@ public class ResourceInformerTests
         using var clusterHost = new TestClusterHostBuilder()
             .UseInitialResources(resources)
             .Build();
+        clusterHost.Cluster.WatchListSupported = true;
         var releaseWatchResponse = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         clusterHost.Cluster.WatchResponseGate = releaseWatchResponse.Task;
 
@@ -260,7 +261,11 @@ public class ResourceInformerTests
             await registration.ReadyAsync(cancellation.Token);
             await informerRunning.Task.WaitAsync(cancellation.Token);
             await clusterHost.Cluster.WaitForWatchRequestAsync(1).WaitAsync(cancellation.Token).DefaultTimeout();
+            var watchListRequest = await clusterHost.Cluster.WaitForWatchListRequestAsync(1)
+                .WaitAsync(cancellation.Token).DefaultTimeout();
             Assert.Equal(ResourceInformerStatus.Running, informer.Status);
+            Assert.True(watchListRequest.SendInitialEvents);
+            Assert.Empty(clusterHost.Cluster.ListRequests);
 
             var statusChanged = false;
             informer.PropertyChanged += (_, args) =>
@@ -492,6 +497,247 @@ public class ResourceInformerTests
         Assert.Equal(new string?[] { null, "next" }, listRequests.Select(invocation => invocation.Arguments[4] as string));
         Assert.Equal(new string?[] { "0", "0" }, listRequests.Select(invocation => invocation.Arguments[8] as string));
         Assert.All(listRequests, invocation => Assert.Equal(1000, invocation.Arguments[7]));
+    }
+
+    [Fact]
+    public async Task WatchListInitializesCacheWithoutAnInitialListRequest()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "streamed" } })
+            .Build();
+        clusterHost.Cluster.WatchListSupported = true;
+        clusterHost.Cluster.WatchEvents.Add(new WatchEvent
+        {
+            Type = "MODIFIED",
+            Object = new ResourceObject
+            {
+                ApiVersion = "v1",
+                Kind = "Pod",
+                Metadata = new V1ObjectMeta { Name = "streamed", ResourceVersion = "2" },
+            },
+        });
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            selector: new ResourceSelector<V1Pod>("metadata.name=streamed"));
+        var received = new ConcurrentQueue<(WatchEventType EventType, string Name)>();
+        var modifiedEvent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+        {
+            received.Enqueue((eventType, pod.Name()));
+            if (eventType == WatchEventType.Modified)
+            {
+                modifiedEvent.TrySetResult();
+            }
+        }));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        var watchListRequest = await clusterHost.Cluster.WaitForWatchListRequestAsync(1)
+            .WaitAsync(cancellation.Token).DefaultTimeout();
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        var firstWatchRequest = await clusterHost.Cluster.WaitForWatchRequestAsync(1)
+            .WaitAsync(cancellation.Token).DefaultTimeout();
+        await modifiedEvent.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+        var secondWatchRequest = await clusterHost.Cluster.WaitForWatchRequestAsync(2)
+            .WaitAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.True(watchListRequest.Watch);
+        Assert.True(watchListRequest.SendInitialEvents);
+        Assert.True(watchListRequest.AllowWatchBookmarks);
+        Assert.Equal("NotOlderThan", watchListRequest.ResourceVersionMatch);
+        Assert.Equal(30, watchListRequest.TimeoutSeconds);
+        Assert.Equal("metadata.name=streamed", watchListRequest.FieldSelector);
+        Assert.Equal("1", firstWatchRequest.ResourceVersion);
+        Assert.Equal("metadata.name=streamed", firstWatchRequest.FieldSelector);
+        Assert.Equal("2", secondWatchRequest.ResourceVersion);
+        Assert.Empty(clusterHost.Cluster.ListRequests);
+        Assert.Equal(
+            [(WatchEventType.Added, "streamed"), (WatchEventType.Modified, "streamed")],
+            received.ToArray());
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task WatchListDoesNotPublishInitialEventsUntilTheCompletionBookmarkArrives()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "partial" } })
+            .Build();
+        clusterHost.Cluster.WatchListSupported = true;
+        var releaseWatchListResponse = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        clusterHost.Cluster.WatchListResponseGate = releaseWatchListResponse.Task;
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new ConcurrentQueue<(WatchEventType EventType, string Name)>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.Enqueue((eventType, pod.Name()))));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await clusterHost.Cluster.WatchListInitialEventsSent.WaitAsync(cancellation.Token).DefaultTimeout();
+        await Task.Delay(TimeSpan.FromMilliseconds(100), cancellation.Token);
+        var eventsBeforeCompletionBookmark = received.ToArray();
+        var readyBeforeCompletionBookmark = registration.ReadyAsync(cancellation.Token).IsCompleted;
+        var statusBeforeCompletionBookmark = informer.Status;
+
+        releaseWatchListResponse.TrySetResult();
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+
+        Assert.Empty(eventsBeforeCompletionBookmark);
+        Assert.False(readyBeforeCompletionBookmark);
+        Assert.Equal(ResourceInformerStatus.Starting, statusBeforeCompletionBookmark);
+        Assert.Equal([(WatchEventType.Added, "partial")], received.ToArray());
+    }
+
+    [Fact]
+    public async Task WatchListBootstrapTimeoutFallsBackToListWithoutPublishingPartialEvents()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "partial" } })
+            .Build();
+        clusterHost.Cluster.WatchListSupported = true;
+        var releaseWatchListResponse = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        clusterHost.Cluster.WatchListResponseGate = releaseWatchListResponse.Task;
+        clusterHost.Cluster.EnqueueListResponse(new ListResult
+        {
+            ResourceVersion = "2",
+            Continue = null!,
+            Items =
+            [
+                new ResourceObject
+                {
+                    ApiVersion = "v1",
+                    Kind = "Pod",
+                    Metadata = new V1ObjectMeta { Name = "listed", ResourceVersion = "2" },
+                },
+            ],
+        });
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            timeoutSeconds: 1);
+        var received = new ConcurrentQueue<(WatchEventType EventType, string Name)>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.Enqueue((eventType, pod.Name()))));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await clusterHost.Cluster.WatchListInitialEventsSent.WaitAsync(cancellation.Token).DefaultTimeout();
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        releaseWatchListResponse.TrySetResult();
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+
+        Assert.Single(clusterHost.Cluster.ListRequests);
+        Assert.Equal(1, clusterHost.Cluster.WatchListRequests.Single().TimeoutSeconds);
+        Assert.Equal([(WatchEventType.Added, "listed")], received.ToArray());
+    }
+
+    [Fact]
+    public async Task RejectedWatchListFallsBackToList()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "listed" } })
+            .Build();
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new List<(WatchEventType EventType, string Name)>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.Add((eventType, pod.Name()))));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        var watchListRequest = await clusterHost.Cluster.WaitForWatchListRequestAsync(1)
+            .WaitAsync(cancellation.Token).DefaultTimeout();
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.True(watchListRequest.SendInitialEvents);
+        Assert.Single(clusterHost.Cluster.ListRequests);
+        Assert.Equal([(WatchEventType.Added, "listed")], received);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task WatchListEndingBeforeInitialEventsEndFallsBackWithoutPublishingPartialState()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "partial" } })
+            .Build();
+        clusterHost.Cluster.WatchListSupported = true;
+        clusterHost.Cluster.WatchListEndsBeforeInitialEventsEnd = true;
+        clusterHost.Cluster.EnqueueListResponse(new ListResult
+        {
+            ResourceVersion = "2",
+            Continue = null!,
+            Items =
+            [
+                new ResourceObject
+                {
+                    ApiVersion = "v1",
+                    Kind = "Pod",
+                    Metadata = new V1ObjectMeta { Name = "listed", ResourceVersion = "2" },
+                },
+            ],
+        });
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new List<(WatchEventType EventType, string Name)>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.Add((eventType, pod.Name()))));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        var watchListRequest = await clusterHost.Cluster.WaitForWatchListRequestAsync(1)
+            .WaitAsync(cancellation.Token).DefaultTimeout();
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.True(watchListRequest.SendInitialEvents);
+        Assert.Single(clusterHost.Cluster.ListRequests);
+        Assert.Equal([(WatchEventType.Added, "listed")], received);
+
+        var cachedResources = new ConcurrentQueue<(WatchEventType EventType, string Name)>();
+        using var cacheVerifier = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            cachedResources.Enqueue((eventType, pod.Name()))));
+        await cacheVerifier.ReadyAsync(cancellation.Token).DefaultTimeout();
+        Assert.Equal([(WatchEventType.Added, "listed")], cachedResources.ToArray());
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
     }
 
     [Fact]

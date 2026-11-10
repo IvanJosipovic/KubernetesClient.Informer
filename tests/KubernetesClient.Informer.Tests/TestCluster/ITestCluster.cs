@@ -22,11 +22,25 @@ public interface ITestCluster
 
     IList<ListParameters> WatchRequests { get; }
 
+    IList<ListParameters> WatchListRequests { get; }
+
+    bool WatchListSupported { get; set; }
+
+    bool WatchListEndsBeforeInitialEventsEnd { get; set; }
+
+    Task WatchListInitialEventsSent { get; }
+
+    Task? WatchListResponseGate { get; set; }
+
+    void MarkWatchListInitialEventsSent();
+
     Task<ListParameters> ListRequested { get; }
 
     Task<ListParameters> WatchRequested { get; }
 
     Task<ListParameters> WaitForWatchRequestAsync(int requestNumber);
+
+    Task<ListParameters> WaitForWatchListRequestAsync(int requestNumber);
 
     IList<WatchEvent> WatchEvents { get; }
 

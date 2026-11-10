@@ -35,5 +35,8 @@ public class ListParameters
     public bool? AllowWatchBookmarks { get; set; }
 
     [FromQuery]
+    public bool? SendInitialEvents { get; set; }
+
+    [FromQuery]
     public string Pretty { get; set; }
 }

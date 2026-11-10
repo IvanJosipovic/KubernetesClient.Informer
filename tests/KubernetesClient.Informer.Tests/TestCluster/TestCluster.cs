@@ -18,6 +18,10 @@ public class TestCluster : ITestCluster
 
     private readonly TaskCompletionSource<ListParameters> _listRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<ListParameters> _watchRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _watchListRequestSync = new();
+    private readonly Dictionary<int, TaskCompletionSource<ListParameters>> _watchListRequestWaiters = new();
+    private readonly TaskCompletionSource<ListParameters> _watchListRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _watchListInitialEventsSent = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _watchRequestSync = new();
     private readonly Dictionary<int, TaskCompletionSource<ListParameters>> _watchRequestWaiters = new();
     private readonly object _listResponseSync = new();
@@ -29,9 +33,21 @@ public class TestCluster : ITestCluster
 
     public IList<ListParameters> WatchRequests { get; } = new List<ListParameters>();
 
+    public IList<ListParameters> WatchListRequests { get; } = new List<ListParameters>();
+
+    public bool WatchListSupported { get; set; }
+
+    public bool WatchListEndsBeforeInitialEventsEnd { get; set; }
+
+    public Task WatchListInitialEventsSent => _watchListInitialEventsSent.Task;
+
+    public Task? WatchListResponseGate { get; set; }
+
     public Task<ListParameters> ListRequested => _listRequested.Task;
 
     public Task<ListParameters> WatchRequested => _watchRequested.Task;
+
+    public Task<ListParameters> WatchListRequested => _watchListRequested.Task;
 
     public Task<ListParameters> WaitForWatchRequestAsync(int requestNumber)
     {
@@ -53,6 +69,30 @@ public class TestCluster : ITestCluster
             return waiter.Task;
         }
     }
+
+    public Task<ListParameters> WaitForWatchListRequestAsync(int requestNumber)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(requestNumber);
+
+        lock (_watchListRequestSync)
+        {
+            if (WatchListRequests.Count >= requestNumber)
+            {
+                return Task.FromResult(WatchListRequests[requestNumber - 1]);
+            }
+
+            if (!_watchListRequestWaiters.TryGetValue(requestNumber, out var waiter))
+            {
+                waiter = new TaskCompletionSource<ListParameters>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _watchListRequestWaiters.Add(requestNumber, waiter);
+            }
+
+            return waiter.Task;
+        }
+    }
+
+    public void MarkWatchListInitialEventsSent()
+        => _watchListInitialEventsSent.TrySetResult();
 
     public IList<WatchEvent> WatchEvents { get; } = new List<WatchEvent>();
 
@@ -91,13 +131,28 @@ public class TestCluster : ITestCluster
         LastListParameters = parameters;
         if (parameters.Watch == true)
         {
-            lock (_watchRequestSync)
+            if (parameters.SendInitialEvents == true)
             {
-                WatchRequests.Add(parameters);
-                _watchRequested.TrySetResult(parameters);
-                if (_watchRequestWaiters.Remove(WatchRequests.Count, out var waiter))
+                lock (_watchListRequestSync)
                 {
-                    waiter.TrySetResult(parameters);
+                    WatchListRequests.Add(parameters);
+                    _watchListRequested.TrySetResult(parameters);
+                    if (_watchListRequestWaiters.Remove(WatchListRequests.Count, out var waiter))
+                    {
+                        waiter.TrySetResult(parameters);
+                    }
+                }
+            }
+            else
+            {
+                lock (_watchRequestSync)
+                {
+                    WatchRequests.Add(parameters);
+                    _watchRequested.TrySetResult(parameters);
+                    if (_watchRequestWaiters.Remove(WatchRequests.Count, out var waiter))
+                    {
+                        waiter.TrySetResult(parameters);
+                    }
                 }
             }
         }

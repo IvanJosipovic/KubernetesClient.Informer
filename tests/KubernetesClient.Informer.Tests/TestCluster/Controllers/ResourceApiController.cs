@@ -5,6 +5,7 @@ using k8s.Models;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using System.Linq;
+using System.Collections.Generic;
 using System.Text.Json;
 using System.Threading.Tasks;
 using KubernetesClient.Informer.Tests.TestCluster.Models;
@@ -30,6 +31,56 @@ public class ResourceApiController : ControllerBase
     [HttpGet]
     public async Task<IActionResult> ListAsync(ListParameters parameters)
     {
+        if (parameters.Watch == true && parameters.SendInitialEvents == true)
+        {
+            var initialList = await _testCluster.ListResourcesAsync(string.Empty, Version, Plural, parameters);
+            if (!_testCluster.WatchListSupported)
+            {
+                return StatusCode(StatusCodes.Status422UnprocessableEntity, new
+                {
+                    kind = "Status",
+                    apiVersion = "v1",
+                    status = "Failure",
+                    message = "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled",
+                    reason = "Invalid",
+                    code = StatusCodes.Status422UnprocessableEntity,
+                });
+            }
+
+            Response.ContentType = "application/json";
+            foreach (var item in initialList.Items)
+            {
+                await Response.WriteAsync(JsonSerializer.Serialize(new WatchEvent { Type = "ADDED", Object = item }));
+                await Response.WriteAsync("\n");
+            }
+
+            await Response.Body.FlushAsync(HttpContext.RequestAborted);
+            _testCluster.MarkWatchListInitialEventsSent();
+            if (_testCluster.WatchListResponseGate is { } watchListResponseGate)
+            {
+                await watchListResponseGate.WaitAsync(HttpContext.RequestAborted);
+            }
+
+            if (_testCluster.WatchListEndsBeforeInitialEventsEnd)
+            {
+                return new EmptyResult();
+            }
+
+            var bookmark = new ResourceObject
+            {
+                ApiVersion = Version,
+                Kind = initialList.Items.FirstOrDefault()?.Kind ?? string.Empty,
+                Metadata = new k8s.Models.V1ObjectMeta
+                {
+                    ResourceVersion = initialList.ResourceVersion ?? "1",
+                    Annotations = new Dictionary<string, string> { ["k8s.io/initial-events-end"] = "true" },
+                },
+            };
+            await Response.WriteAsync(JsonSerializer.Serialize(new WatchEvent { Type = "BOOKMARK", Object = bookmark }));
+            await Response.WriteAsync("\n");
+            return new EmptyResult();
+        }
+
         if (parameters.Watch == true)
         {
             await _testCluster.ListResourcesAsync(string.Empty, Version, Plural, parameters);

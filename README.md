@@ -4,14 +4,14 @@
 [![NuGet downloads](https://img.shields.io/nuget/dt/KubernetesClient.Informer.svg?style=flat-square)](https://www.nuget.org/packages/KubernetesClient.Informer)
 [![codecov](https://codecov.io/gh/IvanJosipovic/KubernetesClient.Informer/graph/badge.svg?token=zXQwCiXAYf)](https://codecov.io/gh/IvanJosipovic/KubernetesClient.Informer)
 
-`KubernetesClient.Informer` is a typed list-and-watch client for Kubernetes resources. It performs an initial list, then watches the Kubernetes API for changes and notifies your application through callbacks. It is based on the informer approach used by [YARP's Kubernetes controller](https://github.com/dotnet/yarp/tree/main/src/Kubernetes.Controller).
+`KubernetesClient.Informer` is a typed list-and-watch client for Kubernetes resources. It initializes its cache using Kubernetes WatchList when available, then watches the API for changes and notifies your application through callbacks. If WatchList is rejected, unsupported by the configured client, or ends before its initial-events bookmark, it falls back to a regular list.
 
 Use it to keep application state synchronized with resources such as Pods, Deployments, or custom resources without repeatedly polling the API.
 
 ## Features
 
 - Typed notifications for added, modified, and deleted resources.
-- Initial listing with pagination, followed by a resource-version-based watch.
+- WatchList-based startup when supported, with paginated list-and-watch fallback.
 - Reconnect and relist handling for transient errors and expired resource versions.
 - Optional Kubernetes field selectors.
 - Hosted-service integration and lifecycle status reporting.
@@ -62,7 +62,7 @@ Console.WriteLine("Initial Pod list is ready. Watching for changes...");
 await host.WaitForShutdownAsync();
 ```
 
-The initial list is delivered through the same callback: listed resources arrive as `Added` events. `ReadyAsync` completes after the initial list has been processed; later changes continue to arrive through the watch. Dispose the returned registration when you no longer need notifications.
+The initial snapshot is delivered through the same callback: resources arrive as `Added` events. `ReadyAsync` completes only after the full snapshot has been committed and processed; WatchList events are staged until Kubernetes sends the initial-events-end bookmark, so callbacks never observe a partial snapshot. Later changes continue to arrive through the watch. Dispose the returned registration when you no longer need notifications.
 
 `RegisterResourceInformer` starts watching automatically when the host starts. For coordinated startup, pass `startWatchingOnHostStart: false` and call `StartWatching()` when ready.
 
@@ -79,7 +79,7 @@ Use a field selector supported by the Kubernetes resource's list endpoint.
 
 ## Lifecycle status
 
-`IResourceInformer.Status` reports the current state: `NotStarted`, `Starting`, `Running`, `Retrying`, `Stopped`, or `Faulted`. The concrete `ResourceInformer<TResource>` also implements `INotifyPropertyChanged` and raises `PropertyChanged` when `Status` changes.
+`IResourceInformer.Status` reports the current state: `NotStarted`, `Starting`, `Running`, `Retrying`, `Stopped`, or `Faulted`. Initial startup first attempts WatchList with a 30-second default bootstrap timeout; rejection, unsupported transport, or an incomplete stream triggers list-and-watch fallback. The concrete `ResourceInformer<TResource>` also implements `INotifyPropertyChanged` and raises `PropertyChanged` when `Status` changes.
 
 ## OpenTelemetry tracing
 
