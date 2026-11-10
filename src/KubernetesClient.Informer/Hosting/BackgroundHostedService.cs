@@ -19,12 +19,25 @@ namespace KubernetesClient.Informer.Hosting;
 /// <seealso cref="IDisposable" />
 public abstract class BackgroundHostedService : IHostedService, IDisposable
 {
+    private static readonly Action<ILogger, string, Exception?> RunStartingLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        new EventId(1, "RunStarting"),
+        "Calling RunAsync for {BackgroundHostedService}");
+    private static readonly Action<ILogger, string, Exception?> RunCompleteLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        new EventId(2, "RunComplete"),
+        "RunAsync completed for {BackgroundHostedService}");
+    private static readonly Action<ILogger, string, Exception?> RequestedStopApplicationLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        new EventId(3, "RequestedStopApplication"),
+        "Called StopApplication for {BackgroundHostedService}");
+
     private readonly IHostApplicationLifetime _hostApplicationLifetime;
     private readonly CancellationTokenRegistration _hostApplicationStoppingRegistration;
     private readonly CancellationTokenSource _runCancellation = new CancellationTokenSource();
     private readonly string _serviceTypeName;
     private bool _disposedValue;
-    private Task _runTask;
+    private Task? _runTask;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="BackgroundHostedService"/> class.
@@ -82,10 +95,7 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
 
             try
             {
-                Logger?.LogInformation(
-                    new EventId(1, "RunStarting"),
-                    "Calling RunAsync for {BackgroundHostedService}",
-                    _serviceTypeName);
+                RunStartingLog(Logger, _serviceTypeName, null);
 
                 try
                 {
@@ -94,10 +104,7 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
                 }
                 finally
                 {
-                    Logger?.LogInformation(
-                        new EventId(2, "RunComplete"),
-                        "RunAsync completed for {BackgroundHostedService}",
-                        _serviceTypeName);
+                    RunCompleteLog(Logger, _serviceTypeName, null);
                 }
             }
             catch
@@ -110,10 +117,7 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
                     // RunAsync is the same.
                     _hostApplicationLifetime.StopApplication();
 
-                    Logger?.LogInformation(
-                        new EventId(3, "RequestedStopApplication"),
-                        "Called StopApplication for {BackgroundHostedService}",
-                        _serviceTypeName);
+                    RequestedStopApplicationLog(Logger, _serviceTypeName, null);
                 }
 
                 throw;
@@ -133,12 +137,12 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
             // signal for the RunAsync call to be completed
             _runCancellation.Cancel();
 
-            // join the result of the RunAsync causality line back into the results of
-            // this StopAsync call. this await statement will not complete until CallRunAsync
-            // method has unwound and returned. if RunAsync completed by throwing an exception
-            // it will be rethrown by this await. rethrown Exceptions will pass through
-            // Hosting and may be caught by Program.Main.
-            await _runTask.ConfigureAwait(false);
+            // Join the run task when it completes, but respect the host's shutdown deadline.
+            // Exceptions from a completed run task still propagate through Hosting.
+            if (_runTask is not null)
+            {
+                await _runTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -146,7 +150,10 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
         }
         finally
         {
-            _runTask = null;
+            if (_runTask?.IsCompleted == true)
+            {
+                _runTask = null;
+            }
         }
     }
 
@@ -157,6 +164,8 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
     /// <returns>A <see cref="Task" /> representing the result of the asynchronous operation.</returns>
     public abstract Task RunAsync(CancellationToken cancellationToken);
 
+    /// <summary>Releases the resources used by this service.</summary>
+    /// <param name="disposing"><see langword="true"/> to release managed and unmanaged resources; otherwise, <see langword="false"/>.</param>
     protected virtual void Dispose(bool disposing)
     {
         if (!_disposedValue)
@@ -187,6 +196,7 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
         }
     }
 
+    /// <summary>Releases all resources used by this service.</summary>
     public void Dispose()
     {
         // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method

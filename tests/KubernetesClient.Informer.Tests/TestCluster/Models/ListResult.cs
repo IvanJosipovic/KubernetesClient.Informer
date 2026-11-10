@@ -7,9 +7,9 @@ namespace KubernetesClient.Informer.Tests.TestCluster.Models;
 
 public class ListResult
 {
-    public string Continue { get; set; }
+    public string? Continue { get; set; }
 
-    public string ResourceVersion { get; set; }
+    public string? ResourceVersion { get; set; }
 
-    public IList<ResourceObject> Items { get; set; }
+    public IList<ResourceObject> Items { get; set; } = Array.Empty<ResourceObject>();
 }

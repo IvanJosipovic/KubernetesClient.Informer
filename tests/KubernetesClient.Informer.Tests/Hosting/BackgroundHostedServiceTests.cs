@@ -5,11 +5,13 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
 using KubernetesClient.Informer.Tests.Hosting.Fakes;
+using Moq;
 
 namespace KubernetesClient.Informer.Hosting.Tests;
 
@@ -41,14 +43,17 @@ public class BackgroundHostedServiceTests
     {
         var latches = new TestLatches();
 
-        using var host = new WebHostBuilder()
-            .ConfigureServices((hbc, services) =>
+        using var host = new HostBuilder()
+            .ConfigureWebHost(webHost =>
             {
-                services.AddSingleton<IServer, FakeServer>();
-                services.AddSingleton<IHostedService, FakeBackgroundHostedService>();
-                services.AddSingleton(latches);
+                webHost.ConfigureServices(services =>
+                {
+                    services.AddSingleton<IServer, FakeServer>();
+                    services.AddSingleton<IHostedService, FakeBackgroundHostedService>();
+                    services.AddSingleton(latches);
+                });
+                webHost.Configure(app => { });
             })
-            .Configure(app => { })
             .Build();
 
         // TODO: figure out why the hosting takes so long to unwind naturally
@@ -69,14 +74,17 @@ public class BackgroundHostedServiceTests
     {
         var context = new TestLatches();
 
-        using var host = new WebHostBuilder()
-            .ConfigureServices((hbc, services) =>
+        using var host = new HostBuilder()
+            .ConfigureWebHost(webHost =>
             {
-                services.AddSingleton<IServer, FakeServer>();
-                services.AddSingleton<IHostedService, FakeBackgroundHostedService>();
-                services.AddSingleton(context);
+                webHost.ConfigureServices(services =>
+                {
+                    services.AddSingleton<IServer, FakeServer>();
+                    services.AddSingleton<IHostedService, FakeBackgroundHostedService>();
+                    services.AddSingleton(context);
+                });
+                webHost.Configure(app => { });
             })
-            .Configure(app => { })
             .Build();
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -84,11 +92,56 @@ public class BackgroundHostedServiceTests
         var runTask = host.RunAsync(cts.Token);
 
 #pragma warning disable CA1303 // Do not pass literals as localized parameters
-        context.RunResult.Throw(new ApplicationException("Unwind"));
+        context.RunResult.Throw(new InvalidOperationException("Unwind"));
 #pragma warning restore CA1303 // Do not pass literals as localized parameters
 
-        var ex = await Assert.ThrowsAsync<AggregateException>(() => runTask);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => runTask);
 
-        Assert.Equal("Unwind", Assert.Single(ex.Flatten().InnerExceptions).Message);
+        Assert.Equal("Unwind", ex.Message);
+    }
+
+    [Fact]
+    public async Task StopAsyncHonorsCancellationTokenWhenRunDoesNotStop()
+    {
+        using var service = new CancellationIgnoringBackgroundHostedService();
+        await service.StartAsync(CancellationToken.None);
+        await service.RunEntered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        using var stopCancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        await service.StopAsync(stopCancellation.Token).WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+
+        Assert.False(service.RunExited.Task.IsCompleted);
+
+        service.ReleaseRun();
+        await service.RunExited.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+    }
+
+    private sealed class CancellationIgnoringBackgroundHostedService : BackgroundHostedService
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public CancellationIgnoringBackgroundHostedService()
+            : base(new Mock<IHostApplicationLifetime>().Object, NullLogger.Instance)
+        {
+        }
+
+        public TaskCompletionSource RunEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource RunExited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void ReleaseRun() => _release.TrySetResult();
+
+        public override async Task RunAsync(CancellationToken cancellationToken)
+        {
+            RunEntered.TrySetResult();
+            try
+            {
+                await _release.Task.ConfigureAwait(false);
+            }
+            finally
+            {
+                RunExited.TrySetResult();
+            }
+        }
     }
 }

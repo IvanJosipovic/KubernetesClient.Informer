@@ -11,14 +11,14 @@ namespace KubernetesClient.Informer.Tests.TestCluster.Models;
 public class ResourceObject : IKubernetesObject<V1ObjectMeta>
 {
     [JsonPropertyName("apiVersion")]
-    public string ApiVersion { get; set; }
+    public string ApiVersion { get; set; } = string.Empty;
 
     [JsonPropertyName("kind")]
-    public string Kind { get; set; }
+    public string Kind { get; set; } = string.Empty;
 
     [JsonPropertyName("metadata")]
-    public V1ObjectMeta Metadata { get; set; }
+    public V1ObjectMeta Metadata { get; set; } = new();
 
     [JsonExtensionData]
-    public IDictionary<string, object> AdditionalData { get; set; }
+    public IDictionary<string, object> AdditionalData { get; set; } = new Dictionary<string, object>();
 }

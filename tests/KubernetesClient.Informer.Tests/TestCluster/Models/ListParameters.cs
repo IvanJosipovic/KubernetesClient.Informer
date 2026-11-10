@@ -8,19 +8,22 @@ namespace KubernetesClient.Informer.Tests.TestCluster.Models;
 public class ListParameters
 {
     [FromQuery]
-    public string Continue { get; set; }
+    public string? Continue { get; set; }
 
     [FromQuery]
-    public string FieldSelector { get; set; }
+    public string? FieldSelector { get; set; }
 
     [FromQuery]
-    public string LabelSelector { get; set; }
+    public string? LabelSelector { get; set; }
 
     [FromQuery]
     public int? Limit { get; set; }
 
     [FromQuery]
-    public string ResourceVersion { get; set; }
+    public string? ResourceVersion { get; set; }
+
+    [FromQuery]
+    public string? ResourceVersionMatch { get; set; }
 
     [FromQuery]
     public int? TimeoutSeconds { get; set; }
@@ -29,5 +32,11 @@ public class ListParameters
     public bool? Watch { get; set; }
 
     [FromQuery]
-    public string Pretty { get; set; }
+    public bool? AllowWatchBookmarks { get; set; }
+
+    [FromQuery]
+    public bool? SendInitialEvents { get; set; }
+
+    [FromQuery]
+    public string? Pretty { get; set; }
 }

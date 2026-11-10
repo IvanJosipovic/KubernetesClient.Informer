@@ -23,15 +23,8 @@ public class TestClusterStartup
     public void Configure(IApplicationBuilder app, ITestCluster cluster)
 #pragma warning restore CA1822 // Mark members as static
     {
-        if (app is null)
-        {
-            throw new System.ArgumentNullException(nameof(app));
-        }
-
-        if (cluster is null)
-        {
-            throw new System.ArgumentNullException(nameof(cluster));
-        }
+        System.ArgumentNullException.ThrowIfNull(app);
+        System.ArgumentNullException.ThrowIfNull(cluster);
 
         app.Use(next => async context =>
         {

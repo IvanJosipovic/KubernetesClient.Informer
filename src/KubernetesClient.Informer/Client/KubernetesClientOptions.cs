@@ -14,5 +14,5 @@ public class KubernetesClientOptions
     /// Gets or sets the configuration.
     /// </summary>
     /// <value>The configuration.</value>
-    public KubernetesClientConfiguration Configuration { get; set; }
+    public KubernetesClientConfiguration? Configuration { get; set; }
 }

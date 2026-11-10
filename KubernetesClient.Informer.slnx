@@ -7,5 +7,6 @@
   </Folder>
   <Project Path="src/KubernetesClient.Informer/KubernetesClient.Informer.csproj" />
   <Project Path="tests/KubernetesClient.Informer.Tests/KubernetesClient.Informer.Tests.csproj" />
+  <Project Path="samples/PodWatcher/PodWatcher.csproj" />
 </Solution>
 

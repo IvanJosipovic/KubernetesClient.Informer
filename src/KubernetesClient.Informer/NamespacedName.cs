@@ -23,7 +23,7 @@ public struct NamespacedName : IEquatable<NamespacedName>
     /// <param name="namespace">The namespace.</param>
     /// <param name="name">The name.</param>
     [JsonConstructor]
-    public NamespacedName(string @namespace, string name)
+    public NamespacedName(string? @namespace, string name)
     {
         Namespace = @namespace;
         Name = name;
@@ -43,7 +43,7 @@ public struct NamespacedName : IEquatable<NamespacedName>
     /// Gets the namespace.
     /// </summary>
     /// <value>The namespace.</value>
-    public string Namespace { get; }
+    public string? Namespace { get; }
 
     /// <summary>
     /// Gets the name.
@@ -102,16 +102,24 @@ public struct NamespacedName : IEquatable<NamespacedName>
             ownerReference.Name);
     }
 
-    public override bool Equals(object obj)
+    /// <summary>Determines whether this instance is equal to the specified object.</summary>
+    /// <param name="obj">The object to compare with this instance.</param>
+    /// <returns><see langword="true"/> if the object is an equal <see cref="NamespacedName"/>; otherwise, <see langword="false"/>.</returns>
+    public override bool Equals(object? obj)
     {
         return obj is NamespacedName name && Equals(name);
     }
 
+    /// <summary>Determines whether this instance is equal to another namespaced name.</summary>
+    /// <param name="other">The value to compare with this instance.</param>
+    /// <returns><see langword="true"/> if the values are equal; otherwise, <see langword="false"/>.</returns>
     public bool Equals([AllowNull] NamespacedName other)
     {
         return Namespace == other.Namespace && Name == other.Name;
     }
 
+    /// <summary>Returns the hash code for this instance.</summary>
+    /// <returns>A hash code based on the namespace and name.</returns>
     public override int GetHashCode()
     {
         return HashCode.Combine(Namespace, Name);

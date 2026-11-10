@@ -63,7 +63,7 @@ public class Limiter
     /// <param name="limit">The count per second which is allowed.</param>
     /// <param name="burst">The burst.</param>
     /// <param name="timeProvider">Accessor for the current UTC time.</param>
-    public Limiter(Limit limit, int burst, TimeProvider timeProvider = default)
+    public Limiter(Limit limit, int burst, TimeProvider? timeProvider = null)
     {
         _limit = limit;
         _burst = burst;
@@ -153,7 +153,7 @@ public class Limiter
 
         if (count > burst && limit != Limit.Max)
         {
-            throw new Exception($"rate: Wait(count={count}) exceeds limiter's burst {burst}");
+            throw new ArgumentOutOfRangeException(nameof(count), count, $"rate: Wait(count={count}) exceeds limiter's burst {burst}");
         }
 
         // Check if ctx is already cancelled
@@ -171,13 +171,13 @@ public class Limiter
                 var delay = r.DelayFrom(now);
                 if (delay > TimeSpan.Zero)
                 {
-                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(delay, _timeProvider, cancellationToken).ConfigureAwait(false);
                 }
 
                 return;
             }
 
-            await Task.Delay(waitLimit, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(waitLimit, _timeProvider, cancellationToken).ConfigureAwait(false);
         }
     }
 

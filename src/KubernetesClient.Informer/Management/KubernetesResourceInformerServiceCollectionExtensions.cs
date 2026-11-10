@@ -21,14 +21,27 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
     /// Registers the resource informer.
     /// </summary>
     /// <typeparam name="TResource">The type of the t related resource.</typeparam>
-    /// <typeparam name="TService">The implementation type of the resource informer.</typeparam>
     /// <param name="services">The services.</param>
     /// <returns>IServiceCollection.</returns>
     public static IServiceCollection RegisterResourceInformer<TResource>(this IServiceCollection services)
         where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
     {
-        return services.RegisterResourceInformer<TResource, ResourceInformer<TResource>>(null);
+        return services.RegisterResourceInformer<TResource, ResourceInformer<TResource>>(null, startWatchingOnHostStart: true);
     }
+
+    /// <summary>
+    /// Registers the resource informer and configures whether it starts watching when the host starts.
+    /// </summary>
+    /// <typeparam name="TResource">The resource type.</typeparam>
+    /// <param name="services">The services.</param>
+    /// <param name="startWatchingOnHostStart">Whether to start watching automatically with the host.</param>
+    /// <returns>The service collection.</returns>
+    public static IServiceCollection RegisterResourceInformer<TResource>(this IServiceCollection services, bool startWatchingOnHostStart)
+        where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
+    {
+        return services.RegisterResourceInformer<TResource, ResourceInformer<TResource>>(null, startWatchingOnHostStart);
+    }
+
     /// <summary>
     /// Registers the resource informer.
     /// </summary>
@@ -36,11 +49,26 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
     /// <typeparam name="TService">The implementation type of the resource informer.</typeparam>
     /// <param name="services">The services.</param>
     /// <returns>IServiceCollection.</returns>
-    public static IServiceCollection RegisterResourceInformer<TResource, TService>(this IServiceCollection services)
+    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services)
         where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
         where TService : IResourceInformer<TResource>
     {
-        return services.RegisterResourceInformer<TResource, TService>(null);
+        return services.RegisterResourceInformer<TResource, TService>(null, startWatchingOnHostStart: true);
+    }
+
+    /// <summary>
+    /// Registers the resource informer and configures whether it starts watching when the host starts.
+    /// </summary>
+    /// <typeparam name="TResource">The resource type.</typeparam>
+    /// <typeparam name="TService">The implementation type of the resource informer.</typeparam>
+    /// <param name="services">The services.</param>
+    /// <param name="startWatchingOnHostStart">Whether to start watching automatically with the host.</param>
+    /// <returns>The service collection.</returns>
+    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services, bool startWatchingOnHostStart)
+        where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
+        where TService : IResourceInformer<TResource>
+    {
+        return services.RegisterResourceInformer<TResource, TService>(null, startWatchingOnHostStart);
     }
 
     /// <summary>
@@ -51,16 +79,32 @@ public static class KubernetesResourceInformerServiceCollectionExtensions
     /// <param name="services">The services.</param>
     /// <param name="fieldSelector">A field selector to constrain the resources the informer retrieves.</param>
     /// <returns>IServiceCollection.</returns>
-    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services, string fieldSelector)
+    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services, string? fieldSelector)
         where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
         where TService : IResourceInformer<TResource>
     {
-        if (string.IsNullOrEmpty(fieldSelector))
+        return services.RegisterResourceInformer<TResource, TService>(fieldSelector, startWatchingOnHostStart: true);
+    }
+
+    /// <summary>
+    /// Registers the resource informer with a field selector and host-start behavior.
+    /// </summary>
+    /// <typeparam name="TResource">The resource type.</typeparam>
+    /// <typeparam name="TService">The implementation type of the resource informer.</typeparam>
+    /// <param name="services">The services.</param>
+    /// <param name="fieldSelector">A field selector to constrain the resources the informer retrieves.</param>
+    /// <param name="startWatchingOnHostStart">Whether to start watching automatically with the host.</param>
+    /// <returns>The service collection.</returns>
+    public static IServiceCollection RegisterResourceInformer<TResource, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TService>(this IServiceCollection services, string? fieldSelector, bool startWatchingOnHostStart)
+        where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
+        where TService : IResourceInformer<TResource>
+    {
+        if (!string.IsNullOrEmpty(fieldSelector))
         {
             services.AddSingleton(new ResourceSelector<TResource>(fieldSelector));
         }
         services.AddSingleton(typeof(IResourceInformer<TResource>), typeof(TService));
 
-        return services.RegisterHostedService<IResourceInformer<TResource>>();
+        return services.RegisterHostedService<IResourceInformer<TResource>>(startWatchingOnHostStart);
     }
 }

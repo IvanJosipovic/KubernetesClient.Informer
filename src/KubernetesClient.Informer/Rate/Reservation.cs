@@ -15,7 +15,7 @@ namespace KubernetesClient.Informer.Rate;
 public class Reservation
 {
     private readonly TimeProvider _timeProvider;
-    private readonly Limiter _limiter;
+    private readonly Limiter? _limiter;
     private readonly Limit _limit;
     private readonly double _tokens;
 
@@ -30,7 +30,7 @@ public class Reservation
     /// <param name="limit">The limit.</param>
     public Reservation(
         TimeProvider timeProvider,
-        Limiter limiter,
+        Limiter? limiter,
         bool ok,
         double tokens = default,
         DateTimeOffset timeToAct = default,

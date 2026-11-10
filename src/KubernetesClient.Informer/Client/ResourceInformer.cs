@@ -3,8 +3,13 @@
 
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using System.Text;
 using k8s;
 using k8s.Autorest;
 using k8s.Models;
@@ -12,6 +17,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using KubernetesClient.Informer.Hosting;
 using KubernetesClient.Informer.Rate;
+using System.ComponentModel;
 
 namespace KubernetesClient.Informer.Client;
 
@@ -23,19 +29,52 @@ namespace KubernetesClient.Informer.Client;
 /// <typeparam name="TResource">The type of the t resource.</typeparam>
 /// <seealso cref="IResourceInformer{TResource}" />
 /// <seealso cref="IDisposable" />
-public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInformer<TResource>
+public partial class ResourceInformer<TResource> : BackgroundHostedService, INotifyPropertyChanged, IResourceInformer<TResource>
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
+    private static readonly TimeSpan HealthyWatchDuration = TimeSpan.FromMinutes(1);
+    private const int WatchListBootstrapTimeoutSeconds = 30;
+    private const string InitialEventsEndAnnotation = "k8s.io/initial-events-end";
+
     private readonly object _sync = new();
     private readonly GroupApiVersionKind _groupApiVersionKind;
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _start = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ResourceSelector<TResource>? _selector;
     private ImmutableList<Registration> _registrations = [];
-    private Dictionary<NamespacedName, IList<V1OwnerReference>> _cache = [];
+    private Dictionary<NamespacedName, TResource> _cache = [];
     private string? _lastResourceVersion;
     private readonly string? _namespace;
+    private readonly TimeProvider _timeProvider;
+    private int _status = (int)ResourceInformerStatus.NotStarted;
+    private int? _timeoutSeconds;
     private readonly int _resourceListLimit;
+    private bool _disposed;
+    private bool _initialListCompleted;
+    private bool _lastResourceVersionUnavailable;
+    private int _runActive;
+    private int _runInfiniteActive;
+    private readonly AsyncLocal<bool> _runInfiniteInvocation = new();
+
+    /// <summary>
+    /// Occurs when a property value changes.
+    /// </summary>
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    /// <inheritdoc/>
+    public ResourceInformerStatus Status
+    {
+        get => (ResourceInformerStatus)Volatile.Read(ref _status);
+        private set
+        {
+            if (Interlocked.Exchange(ref _status, (int)value) == (int)value)
+            {
+                return;
+            }
+
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status)));
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ResourceInformer{TResource}" /> class.
@@ -45,8 +84,10 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
     /// <param name="logger">The logger.</param>
     /// <param name="selector">A resource selector for (optionally) filtering the list of resources.</param>
     /// <param name="namespace">The Namespace to scope the informer.</param>
+    /// <param name="timeoutSeconds">The timeout in seconds for list and watch operations.</param>
     /// <param name="resourceListLimit">The maximum number of resources to request in each list page.</param>
     /// <param name="groupApiVersionKind">The resource group, API version, kind, and plural name to use when accessing the Kubernetes API.</param>
+    /// <param name="timeProvider">The time provider used for retry delays and watch timeouts.</param>
     public ResourceInformer(
         IKubernetes client,
         IHostApplicationLifetime hostApplicationLifetime,
@@ -54,7 +95,9 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         ResourceSelector<TResource>? selector = null,
         string? @namespace = null,
         int resourceListLimit = 1000,
-        GroupApiVersionKind? groupApiVersionKind = null)
+        int? timeoutSeconds = null,
+        GroupApiVersionKind? groupApiVersionKind = null,
+        TimeProvider? timeProvider = null)
         : base(hostApplicationLifetime, logger)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -63,8 +106,10 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         Client = client;
         _selector = selector;
         _namespace = @namespace;
-        _resourceListLimit = resourceListLimit;
         _groupApiVersionKind = groupApiVersionKind ?? GroupApiVersionKind.From<TResource>();
+        _timeoutSeconds = timeoutSeconds;
+        _resourceListLimit = resourceListLimit;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     private enum EventType
@@ -73,35 +118,147 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         SynchronizeComplete = 102,
         WatchingResource = 103,
         ReceivedError = 104,
-        WatchingComplete = 105,
+        WatchingStopped = 105,
         InformerWatchEvent = 106,
         DisposingToReconnect = 107,
         IgnoringError = 108,
+        WatchingFailed = 109,
+        WatchingRetryScheduled = 110,
+        CallbackFailed = 111,
     }
 
+    private static readonly Action<ILogger, string, Exception?> WatchingStoppedLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        EventId(EventType.WatchingStopped),
+        "Stopped watching {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, Exception?> WatchingFailedLog = LoggerMessage.Define<string>(
+        LogLevel.Error,
+        EventId(EventType.WatchingFailed),
+        "Failed while watching {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, TimeSpan, Exception?> RetryScheduledWarningLog = LoggerMessage.Define<string, TimeSpan>(
+        LogLevel.Warning,
+        EventId(EventType.WatchingRetryScheduled),
+        "Retrying {ResourceType} in {RetryDelay} after a failure.");
+    private static readonly Action<ILogger, string, TimeSpan, Exception?> RetryScheduledErrorLog = LoggerMessage.Define<string, TimeSpan>(
+        LogLevel.Error,
+        EventId(EventType.WatchingRetryScheduled),
+        "Retrying {ResourceType} in {RetryDelay} after a failure.");
+    private static readonly Action<ILogger, string, TimeSpan, Exception?> ExpiredResourceVersionLog = LoggerMessage.Define<string, TimeSpan>(
+        LogLevel.Information,
+        EventId(EventType.ReceivedError),
+        "Resource version expired for {ResourceType}; retrying with a full relist in {RetryDelay}.");
+    private static readonly Action<ILogger, string, int?, TimeSpan, Exception?> ListWatchFailureWarningLog = LoggerMessage.Define<string, int?, TimeSpan>(
+        LogLevel.Warning,
+        EventId(EventType.ReceivedError),
+        "List/watch for {ResourceType} failed with status code {StatusCode}; retrying in {RetryDelay}.");
+    private static readonly Action<ILogger, string, int?, TimeSpan, Exception?> ListWatchFailureErrorLog = LoggerMessage.Define<string, int?, TimeSpan>(
+        LogLevel.Error,
+        EventId(EventType.ReceivedError),
+        "List/watch for {ResourceType} failed with status code {StatusCode}; retrying in {RetryDelay}.");
+    private static readonly Action<ILogger, string, string?, Exception?> SynchronizeStartedWithSelectorLog = LoggerMessage.Define<string, string?>(
+        LogLevel.Information,
+        EventId(EventType.SynchronizeStarted),
+        "Started synchronizing {ResourceType} resources from API server with field selector '{FieldSelector}'.");
+    private static readonly Action<ILogger, string, Exception?> SynchronizeStartedLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        EventId(EventType.SynchronizeStarted),
+        "Started synchronizing {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, Exception?> SynchronizeCompleteLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        EventId(EventType.SynchronizeComplete),
+        "Completed synchronizing {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, string?, Exception?> WatchingResourceLog = LoggerMessage.Define<string, string?>(
+        LogLevel.Information,
+        EventId(EventType.WatchingResource),
+        "Watching {ResourceType} starting from resource version {ResourceVersion}.");
+    private static readonly Action<ILogger, string, Exception?> DisposingWatcherLog = LoggerMessage.Define<string>(
+        LogLevel.Debug,
+        EventId(EventType.DisposingToReconnect),
+        "Disposing watcher for {ResourceType} to cause reconnect.");
+    private static readonly Action<ILogger, string, WatchEventType, string?, string?, string?, string?, Exception?> InformerWatchEventLog = LoggerMessage.Define<string, WatchEventType, string?, string?, string?, string?>(
+        LogLevel.Debug,
+        EventId(EventType.InformerWatchEvent),
+        "Informer {ResourceType} received {WatchEventType} notification for {ItemKind}/{ItemName}.{ItemNamespace} at resource version {ResourceVersion}");
+    private static readonly Action<ILogger, string, Exception?> CallbackFailedLog = LoggerMessage.Define<string>(
+        LogLevel.Error,
+        EventId(EventType.CallbackFailed),
+        "ResourceInformerCallback for {ResourceType} failed; removing its registration.");
+    /// <summary>Gets the Kubernetes API client used by this informer.</summary>
     protected IKubernetes Client { get; init; }
 
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
+        if (disposing)
+        {
+            lock (_sync)
+            {
+                if (!_disposed)
+                {
+                    _disposed = true;
+                    foreach (var registration in _registrations)
+                    {
+                        registration.Complete();
+                    }
+
+                    _registrations = [];
+                }
+            }
+        }
+
         base.Dispose(disposing);
     }
 
+    /// <inheritdoc/>
     public void StartWatching()
     {
-        _start.TrySetResult();
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (Status == ResourceInformerStatus.NotStarted)
+            {
+                Status = ResourceInformerStatus.Starting;
+            }
+
+            _start.TrySetResult();
+        }
     }
 
+    /// <inheritdoc/>
     public virtual IResourceInformerRegistration Register(ResourceInformerCallback<TResource> callback)
     {
         ArgumentNullException.ThrowIfNull(callback);
-        return new Registration(this, callback);
+
+        Registration registration;
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            registration = new Registration(this, callback, waitForInformerSync: !_initialListCompleted);
+            _registrations = _registrations.Add(registration);
+
+            if (_initialListCompleted)
+            {
+                foreach (var resource in _cache.Values)
+                {
+                    registration.Enqueue(WatchEventType.Added, resource);
+                }
+
+                registration.EnqueueReady();
+            }
+
+            registration.Start();
+        }
+
+        return registration;
     }
 
+    /// <inheritdoc/>
     public IResourceInformerRegistration Register(ResourceInformerCallback<IKubernetesObject<V1ObjectMeta>> callback)
     {
         ArgumentNullException.ThrowIfNull(callback);
-        return new Registration(this, (eventType, resource) => callback(eventType, resource));
+
+        return Register((ResourceInformerCallback<TResource>)((eventType, resource) => callback(eventType, resource)));
     }
 
     /// <inheritdoc/>
@@ -110,162 +267,672 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         await _ready.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// RunAsync starts processing when StartAsync is called, and is terminated when
-    /// StopAsync is called.
-    /// </summary>
-    /// <param name="cancellationToken">The cancellation token that can be used by other objects or threads to receive notice of cancellation.</param>
-    /// <returns>A <see cref="Task"/> representing the result of the asynchronous operation.</returns>
+    /// <inheritdoc/>
     public override async Task RunAsync(CancellationToken cancellationToken)
     {
-        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(RunAsync), ActivityKind.Consumer);
-        SetResourceTags(activity);
+        lock (_sync)
+        {
+            if (_runActive != 0 || (_runInfiniteActive != 0 && !_runInfiniteInvocation.Value))
+            {
+                throw new InvalidOperationException("The informer is already running.");
+            }
+
+            _runActive = 1;
+        }
+
+        var isRunInfiniteInvocation = _runInfiniteInvocation.Value;
 
         try
         {
-            await _start.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-            var limiter = new Limiter(new Limit(0.2), 3);
-            var shouldSync = true;
-            var firstSync = true;
-
-            while (true)
+            await RunCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_sync)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                try
-                {
-                    if (shouldSync)
-                    {
-                        await ListAsync(cancellationToken).ConfigureAwait(false);
-                        shouldSync = false;
-                    }
-
-                    if (firstSync)
-                    {
-                        _ready.TrySetResult();
-                        firstSync = false;
-                    }
-
-                    await WatchAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch (IOException ex) when (ex.InnerException is SocketException)
-                {
-                    InformerDiagnostics.RecordException(activity, ex);
-                    Logger.LogDebug(
-                        EventId(EventType.ReceivedError),
-                        "Received error watching {ResourceType}: {ErrorMessage}",
-                        typeof(TResource).Name,
-                        ex.Message);
-                }
-                catch (KubernetesException ex)
-                {
-                    InformerDiagnostics.RecordException(activity, ex);
-                    Logger.LogDebug(
-                        EventId(EventType.ReceivedError),
-                        "Received error watching {ResourceType}: {ErrorMessage}",
-                        typeof(TResource).Name,
-                        ex.Message);
-
-                    // deal with this non-recoverable condition "too old resource version"
-                    // with a re-sync to listing everything again ensuring no subscribers miss updates
-                    if (string.Equals(ex.Status.Reason, "Expired", StringComparison.Ordinal))
-                    {
-                        shouldSync = true;
-                    }
-                }
-
-                // rate limiting the reconnect loop
-                await limiter.WaitAsync(cancellationToken).ConfigureAwait(false);
+                _runActive = 0;
             }
         }
-        catch (OperationCanceledException ex) when (ex.CancellationToken == cancellationToken && cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception error)
-        {
-            InformerDiagnostics.RecordException(activity, error);
-            Logger.LogInformation(
-                EventId(EventType.WatchingComplete),
-                error,
-                "No longer watching {ResourceType} resources from API server.",
-                typeof(TResource).Name);
-            throw;
-        }
-    }
 
-    /// <summary>
-    /// Runs the Informer in a while loop until cancellation requested
-    /// </summary>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    public async Task RunInfinite(CancellationToken cancellationToken)
-    {
-        while (true)
+        async Task RunCoreAsync(CancellationToken runCancellationToken)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(RunAsync), ActivityKind.Consumer);
+            SetResourceTags(activity);
+            Status = ResourceInformerStatus.Starting;
 
             try
             {
-                await RunAsync(cancellationToken).ConfigureAwait(false);
+                await _start.Task.WaitAsync(runCancellationToken).ConfigureAwait(false);
+
+                await RunListWatchAsync(runCancellationToken).ConfigureAwait(true);
             }
-            catch (OperationCanceledException ex) when (ex.CancellationToken == cancellationToken && cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (runCancellationToken.IsCancellationRequested)
             {
+                if (!isRunInfiniteInvocation)
+                {
+                    _ready.TrySetCanceled(runCancellationToken);
+                }
+
+                Status = ResourceInformerStatus.Stopped;
+                WatchingStoppedLog(Logger, typeof(TResource).Name, null);
                 throw;
             }
-            catch (OperationCanceledException)
+            catch (Exception error)
             {
+                if (!isRunInfiniteInvocation)
+                {
+                    _ready.TrySetException(error);
+                }
+
+                Status = ResourceInformerStatus.Faulted;
+                InformerDiagnostics.RecordException(activity, error);
+                if (!isRunInfiniteInvocation || error is OperationCanceledException)
+                {
+                    WatchingFailedLog(Logger, typeof(TResource).Name, error);
+                }
                 throw;
-            }
-            catch (Exception)
-            {
-                // rate limiting the reconnect loop
-                Logger.LogInformation(
-                    EventId(EventType.WatchingComplete),
-                    "Retrying {ResourceType} in 10s",
-                    typeof(TResource).Name);
-                await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
             }
         }
     }
 
-    protected virtual async Task<HttpOperationResponse<KubernetesList<TResource>>> RetrieveResourceListAsync(bool? watch = null, string? continueParameter = null, string? resourceVersion = null, ResourceSelector<TResource>? resourceSelector = null, int? limit = null, CancellationToken cancellationToken = default)
+    /// <inheritdoc/>
+    public async Task RunInfinite(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrEmpty(_namespace))
+        lock (_sync)
         {
-            var listWithHttpMessage = await Client.CustomObjects.ListClusterCustomObjectWithHttpMessagesAsync<KubernetesList<TResource>>(
-            _groupApiVersionKind.Group,
-            _groupApiVersionKind.ApiVersion,
-            _groupApiVersionKind.PluralName,
-            continueParameter: continueParameter,
-            fieldSelector: resourceSelector?.FieldSelector,
-            watch: watch,
-            limit: limit,
-            resourceVersion: resourceVersion,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (_runActive != 0 || _runInfiniteActive != 0)
+            {
+                throw new InvalidOperationException("The informer is already running.");
+            }
 
-            return listWithHttpMessage;
+            _runInfiniteActive = 1;
         }
-        else
-        {
-            var listWithHttpMessage = await Client.CustomObjects.ListNamespacedCustomObjectWithHttpMessagesAsync<KubernetesList<TResource>>(
-            _groupApiVersionKind.Group,
-            _groupApiVersionKind.ApiVersion,
-            _namespace,
-            _groupApiVersionKind.PluralName,
-            continueParameter: continueParameter,
-            fieldSelector: resourceSelector?.FieldSelector,
-            watch: watch,
-            limit: limit,
-            resourceVersion: resourceVersion,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            return listWithHttpMessage;
+        try
+        {
+            StartWatching();
+            var retryAttempt = 0;
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    _runInfiniteInvocation.Value = true;
+                    try
+                    {
+                        await RunAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _runInfiniteInvocation.Value = false;
+                    }
+                }
+                catch (Exception error) when (!cancellationToken.IsCancellationRequested
+                    && error is not OperationCanceledException
+                    && IsRetryable(error))
+                {
+                    Status = ResourceInformerStatus.Retrying;
+                    var retryDelay = GetRetryDelay(error, retryAttempt++, _timeProvider);
+
+                    var logLevel = GetFailureLogLevel(error, GetStatusCode(error));
+                    var log = logLevel == LogLevel.Warning ? RetryScheduledWarningLog : RetryScheduledErrorLog;
+                    log(Logger, typeof(TResource).Name, retryDelay, error);
+
+                    await Task.Delay(retryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            _ready.TrySetCanceled(cancellationToken);
+            Status = ResourceInformerStatus.Stopped;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _ready.TrySetCanceled(cancellationToken);
+            Status = ResourceInformerStatus.Stopped;
+        }
+        catch (Exception error)
+        {
+            _ready.TrySetException(error);
+            Status = ResourceInformerStatus.Faulted;
+            if (!IsRetryable(error))
+            {
+                WatchingFailedLog(Logger, typeof(TResource).Name, error);
+            }
+
+            throw;
+        }
+        finally
+        {
+            _runInfiniteInvocation.Value = false;
+            lock (_sync)
+            {
+                _runInfiniteActive = 0;
+            }
+        }
+    }
+
+    private async Task RunListWatchAsync(CancellationToken cancellationToken)
+    {
+        var limiter = new Limiter(new Limit(0.2), 3, _timeProvider);
+        var shouldSync = true;
+        var firstSync = true;
+        var watchListSupported = true;
+        var retryAttempt = 0;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (shouldSync)
+                {
+                    if (watchListSupported)
+                    {
+                        watchListSupported = await TryWatchListAsync(() =>
+                        {
+                            shouldSync = false;
+                            firstSync = false;
+                            _ready.TrySetResult();
+                        }, cancellationToken).ConfigureAwait(true);
+                    }
+
+                    if (shouldSync)
+                    {
+                        await ListAsync(cancellationToken).ConfigureAwait(true);
+                        shouldSync = false;
+                    }
+                }
+
+                if (firstSync)
+                {
+                    _ready.TrySetResult();
+                    firstSync = false;
+                }
+
+                Status = ResourceInformerStatus.Running;
+                var watchStartedAt = _timeProvider.GetTimestamp();
+                try
+                {
+                    await WatchAsync(cancellationToken).ConfigureAwait(true);
+                }
+                catch
+                {
+                    if (_timeProvider.GetElapsedTime(watchStartedAt) >= HealthyWatchDuration)
+                    {
+                        retryAttempt = 0;
+                    }
+
+                    throw;
+                }
+
+                Status = ResourceInformerStatus.Retrying;
+                retryAttempt = 0;
+            }
+            catch (IOException ex) when (ex.InnerException is SocketException)
+            {
+                Status = ResourceInformerStatus.Retrying;
+                await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+            catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Status = ResourceInformerStatus.Retrying;
+                await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+            catch (HttpRequestException ex)
+            {
+                Status = ResourceInformerStatus.Retrying;
+                await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+            catch (HttpOperationException ex)
+            {
+                if (!IsRetryable(ex))
+                {
+                    throw;
+                }
+
+                Status = ResourceInformerStatus.Retrying;
+
+                if (IsExpiredResourceVersion(ex))
+                {
+                    shouldSync = true;
+                }
+
+                await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+            catch (KubernetesException ex)
+            {
+                if (!IsRetryable(ex))
+                {
+                    throw;
+                }
+
+                Status = ResourceInformerStatus.Retrying;
+
+                // Resource version expiry requires a full re-sync so no updates are missed.
+                if (IsExpiredResourceVersion(ex))
+                {
+                    shouldSync = true;
+                }
+
+                await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                Status = ResourceInformerStatus.Retrying;
+                await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            // rate limiting the reconnect loop
+            await limiter.WaitAsync(cancellationToken).ConfigureAwait(true);
         }
     }
 
     private static EventId EventId(EventType eventType) => new EventId((int)eventType, eventType.ToString());
+
+    private async Task<bool> TryWatchListAsync(Action initialSyncCompleted, CancellationToken cancellationToken)
+    {
+        using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(TryWatchListAsync), ActivityKind.Client);
+        SetResourceTags(activity);
+        using var bootstrapTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var bootstrapTimeoutSeconds = _timeoutSeconds is > 0
+            ? _timeoutSeconds.Value
+            : WatchListBootstrapTimeoutSeconds;
+        bootstrapTimeout.CancelAfter(TimeSpan.FromSeconds(bootstrapTimeoutSeconds));
+
+        try
+        {
+            return await TryWatchListCoreAsync(initialSyncCompleted, activity, bootstrapTimeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            activity?.SetStatus(ActivityStatusCode.Error, "WatchList bootstrap timed out.");
+            return false;
+        }
+    }
+
+    private async Task<bool> TryWatchListCoreAsync(
+        Action initialSyncCompleted,
+        Activity? activity,
+        CancellationToken cancellationToken)
+    {
+        HttpOperationResponse<TResource>? watchListResponse;
+        try
+        {
+            watchListResponse = await CreateWatchListResponseAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (WatchListUnsupportedException)
+        {
+            activity?.SetStatus(ActivityStatusCode.Error, "The API server rejected sendInitialEvents.");
+            return false;
+        }
+
+        if (watchListResponse is null)
+        {
+            return false;
+        }
+
+        using (watchListResponse)
+        using (watchListResponse.Request)
+        {
+            var initialItems = new List<TResource>();
+            var nextCache = new Dictionary<NamespacedName, TResource>();
+
+            await foreach (var (eventType, resource) in ReadWatchEventsAsync(
+                watchListResponse.Response.Content,
+                cancellationToken).ConfigureAwait(false))
+            {
+                if (eventType == WatchEventType.Bookmark)
+                {
+                    if (!IsInitialEventsEnd(resource))
+                    {
+                        continue;
+                    }
+
+                    var resourceVersion = resource.ResourceVersion();
+                    if (string.IsNullOrEmpty(resourceVersion))
+                    {
+                        activity?.SetStatus(ActivityStatusCode.Error, "The initial-events bookmark did not include a resource version.");
+                        return false;
+                    }
+
+                    await CommitInitialCacheAsync(nextCache, initialItems, resourceVersion, activity).ConfigureAwait(false);
+                    initialSyncCompleted();
+                    activity?.SetStatus(ActivityStatusCode.Ok);
+                    return true;
+                }
+
+                // The initial-events phase is a consistent snapshot of ADDED events. Never
+                // publish any part of it until the API server's completion bookmark arrives.
+                if (eventType != WatchEventType.Added)
+                {
+                    activity?.SetStatus(ActivityStatusCode.Error, "Unexpected event before the initial-events bookmark.");
+                    return false;
+                }
+
+                resource.ApiVersion = _groupApiVersionKind.GroupApiVersion;
+                resource.Kind = _groupApiVersionKind.Kind;
+                initialItems.Add(resource);
+                nextCache[NamespacedName.From(resource)] = resource;
+            }
+        }
+
+        // Older API servers can ignore unknown query parameters and end the watch without
+        // the marker. Fall back instead of publishing an incomplete cache.
+        activity?.SetStatus(ActivityStatusCode.Error, "The watch ended before the initial-events bookmark.");
+        return false;
+    }
+
+    private static bool IsInitialEventsEnd(TResource resource)
+        => resource.Metadata?.Annotations?.TryGetValue(InitialEventsEndAnnotation, out var value) == true
+            && string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+
+    private static async IAsyncEnumerable<(WatchEventType EventType, TResource Resource)> ReadWatchEventsAsync(
+        HttpContent content,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await using var stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
+
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        {
+            var genericEvent = KubernetesJson.Deserialize<Watcher<KubernetesObject>.WatchEvent>(line);
+            if (genericEvent.Object?.Kind == "Status")
+            {
+                var statusEvent = KubernetesJson.Deserialize<Watcher<V1Status>.WatchEvent>(line);
+                throw new KubernetesException(statusEvent.Object);
+            }
+
+            var watchEvent = KubernetesJson.Deserialize<Watcher<TResource>.WatchEvent>(line);
+            yield return (watchEvent.Type, watchEvent.Object);
+        }
+    }
+
+    private void LogListWatchFailure(Exception error, TimeSpan retryDelay)
+    {
+        InformerDiagnostics.RecordException(Activity.Current, error);
+
+        if (IsExpiredResourceVersion(error))
+        {
+            ExpiredResourceVersionLog(Logger, typeof(TResource).Name, retryDelay, error);
+            return;
+        }
+
+        var statusCode = GetStatusCode(error);
+        var level = GetFailureLogLevel(error, statusCode);
+        var log = level == LogLevel.Warning ? ListWatchFailureWarningLog : ListWatchFailureErrorLog;
+        log(Logger, typeof(TResource).Name, statusCode, retryDelay, error);
+    }
+
+    private static LogLevel GetFailureLogLevel(Exception error, int? statusCode)
+    {
+        if (statusCode is (int)HttpStatusCode.RequestTimeout or (int)HttpStatusCode.TooManyRequests
+            || statusCode >= 500)
+        {
+            return LogLevel.Warning;
+        }
+
+        if (statusCode is >= 400 and < 500)
+        {
+            return LogLevel.Error;
+        }
+
+        return error is IOException or HttpRequestException or OperationCanceledException
+            ? LogLevel.Warning
+            : LogLevel.Error;
+    }
+
+    private static int? GetStatusCode(Exception error)
+        => error switch
+        {
+            HttpOperationException httpException => (int?)httpException.Response?.StatusCode,
+            KubernetesException kubernetesException => kubernetesException.Status?.Code,
+            HttpRequestException httpRequestException => (int?)httpRequestException.StatusCode,
+            _ => null,
+        };
+
+    private static bool IsExpiredResourceVersion(Exception exception)
+        => exception switch
+        {
+            HttpOperationException httpException => IsExpiredResourceVersion(httpException),
+            KubernetesException kubernetesException => IsExpiredResourceVersion(kubernetesException),
+            _ => false,
+        };
+
+    private static bool IsExpiredResourceVersion(KubernetesException exception)
+        => exception.Status?.Code == (int)HttpStatusCode.Gone
+            || string.Equals(exception.Status?.Reason, "Expired", StringComparison.Ordinal);
+
+    private static bool IsExpiredResourceVersion(HttpOperationException exception)
+        => exception.Response?.StatusCode == HttpStatusCode.Gone;
+
+    private static bool IsRetryable(HttpOperationException exception)
+        => IsRetryableStatusCode((int?)exception.Response?.StatusCode);
+
+    private static bool IsRetryable(KubernetesException exception)
+        => IsExpiredResourceVersion(exception) || IsRetryableStatusCode(exception.Status?.Code);
+
+    private static bool IsRetryable(Exception exception)
+        => exception switch
+        {
+            HttpOperationException httpException => IsRetryable(httpException),
+            KubernetesException kubernetesException => IsRetryable(kubernetesException),
+            _ => true,
+        };
+
+    private static bool IsRetryableStatusCode(int? statusCode)
+        => statusCode is (int)HttpStatusCode.Gone or (int)HttpStatusCode.TooManyRequests
+            || statusCode >= 500;
+
+    private string? GetListResourceVersion()
+    {
+        lock (_sync)
+        {
+            if (_lastResourceVersionUnavailable)
+            {
+                return null;
+            }
+
+            // Match client-go: start at the watch cache, then relist from the last observed version.
+            return string.IsNullOrEmpty(_lastResourceVersion) ? "0" : _lastResourceVersion;
+        }
+    }
+
+    private void MarkListResourceVersionUnavailable()
+    {
+        lock (_sync)
+        {
+            _lastResourceVersionUnavailable = true;
+        }
+    }
+
+    private static TimeSpan GetRetryDelay(Exception exception, int attempt, TimeProvider timeProvider)
+    {
+        const double initialSeconds = 1;
+        const double maximumBackoffSeconds = 60;
+        const double maximumRetryAfterSeconds = 300;
+
+        var backoffSeconds = Math.Min(initialSeconds * Math.Pow(2, Math.Min(attempt, 6)), maximumBackoffSeconds);
+        var jitteredBackoff = TimeSpan.FromSeconds(backoffSeconds * (0.5 + Random.Shared.NextDouble()));
+        var retryAfter = GetRetryAfter(exception, timeProvider);
+
+        if (retryAfter is null || retryAfter <= jitteredBackoff)
+        {
+            return jitteredBackoff;
+        }
+
+        return retryAfter.Value > TimeSpan.FromSeconds(maximumRetryAfterSeconds)
+            ? TimeSpan.FromSeconds(maximumRetryAfterSeconds)
+            : retryAfter.Value;
+    }
+
+    private static TimeSpan? GetRetryAfter(Exception exception, TimeProvider timeProvider)
+    {
+        if (exception is KubernetesException kubernetesException
+            && kubernetesException.Status?.Details?.RetryAfterSeconds is { } retryAfterSeconds
+            && retryAfterSeconds >= 0)
+        {
+            return TimeSpan.FromSeconds(retryAfterSeconds);
+        }
+
+        if (exception is not HttpOperationException httpOperationException
+            || httpOperationException.Response?.Headers is not { } headers
+            || !headers.TryGetValue("Retry-After", out var values))
+        {
+            return null;
+        }
+
+        var value = values.FirstOrDefault();
+        if (int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) && seconds >= 0)
+        {
+            return TimeSpan.FromSeconds(seconds);
+        }
+
+        if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var retryAt))
+        {
+            var delay = retryAt - timeProvider.GetUtcNow();
+            return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
+        }
+
+        return null;
+    }
+
+    private async Task WaitBeforeRetryAsync(Exception exception, int attempt, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var retryDelay = GetRetryDelay(exception, attempt, _timeProvider);
+        LogListWatchFailure(exception, retryDelay);
+        await Task.Delay(retryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task<HttpOperationResponse<TResponse>> CreateResponseAsync<TResponse>(bool? watch, int? limit, bool? allowWatchBookmarks, string? continueParameter, string? resourceVersion, CancellationToken cancellationToken)
+        where TResponse : class
+    {
+        if (string.IsNullOrEmpty(_namespace))
+        {
+            return Client.CustomObjects.ListClusterCustomObjectWithHttpMessagesAsync<TResponse>(
+                _groupApiVersionKind.Group,
+                _groupApiVersionKind.ApiVersion,
+                _groupApiVersionKind.PluralName,
+                allowWatchBookmarks: allowWatchBookmarks,
+                continueParameter: continueParameter,
+                fieldSelector: _selector?.FieldSelector,
+                watch: watch,
+                limit: limit,
+                resourceVersion: resourceVersion,
+                timeoutSeconds: _timeoutSeconds,
+                cancellationToken: cancellationToken);
+        }
+
+        return Client.CustomObjects.ListNamespacedCustomObjectWithHttpMessagesAsync<TResponse>(
+            _groupApiVersionKind.Group,
+            _groupApiVersionKind.ApiVersion,
+            _namespace,
+            _groupApiVersionKind.PluralName,
+            allowWatchBookmarks: allowWatchBookmarks,
+            continueParameter: continueParameter,
+            fieldSelector: _selector?.FieldSelector,
+            watch: watch,
+            limit: limit,
+            resourceVersion: resourceVersion,
+            timeoutSeconds: _timeoutSeconds,
+                cancellationToken: cancellationToken);
+    }
+
+    private async Task<HttpOperationResponse<TResource>?> CreateWatchListResponseAsync(CancellationToken cancellationToken)
+    {
+        // KubernetesClient's generic custom-object methods don't expose sendInitialEvents.
+        // Use its configured transport and credentials for this one request; other IKubernetes
+        // implementations retain the portable list-then-watch behavior.
+        if (Client is not Kubernetes kubernetes)
+        {
+            return null;
+        }
+
+        var path = new StringBuilder();
+        if (string.IsNullOrEmpty(_groupApiVersionKind.Group))
+        {
+            path.Append("api/");
+        }
+        else
+        {
+            path.Append("apis/")
+                .Append(Uri.EscapeDataString(_groupApiVersionKind.Group))
+                .Append('/');
+        }
+
+        path.Append(Uri.EscapeDataString(_groupApiVersionKind.ApiVersion));
+        if (!string.IsNullOrEmpty(_namespace))
+        {
+            path.Append("/namespaces/").Append(Uri.EscapeDataString(_namespace));
+        }
+
+        path.Append('/').Append(Uri.EscapeDataString(_groupApiVersionKind.PluralName));
+
+        var query = new List<string>
+        {
+            "watch=true",
+            "sendInitialEvents=true",
+            "allowWatchBookmarks=true",
+            "resourceVersionMatch=NotOlderThan",
+            $"timeoutSeconds={(_timeoutSeconds is > 0 ? _timeoutSeconds.Value : WatchListBootstrapTimeoutSeconds)}",
+        };
+
+        if (_selector?.FieldSelector is { } fieldSelector)
+        {
+            query.Add($"fieldSelector={Uri.EscapeDataString(fieldSelector)}");
+        }
+
+        var baseUri = Client.BaseUri.ToString().TrimEnd('/') + "/";
+        var requestUri = new Uri(new Uri(baseUri, UriKind.Absolute), $"{path}?{string.Join('&', query)}");
+        var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        request.Headers.Accept.ParseAdd("application/json");
+        HttpResponseMessage? response = null;
+
+        try
+        {
+            await kubernetes.Credentials.ProcessHttpRequestAsync(request, cancellationToken).ConfigureAwait(false);
+            response = await kubernetes.HttpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                if (response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.UnprocessableEntity
+                    && responseBody.Contains("sendInitialEvents", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new WatchListUnsupportedException();
+                }
+
+                throw new HttpRequestException(
+                    $"WatchList request failed with status {(int)response.StatusCode} ({response.StatusCode}): {responseBody}",
+                    inner: null,
+                    response.StatusCode);
+            }
+
+            return new HttpOperationResponse<TResource>
+            {
+                Request = request,
+                Response = response,
+            };
+        }
+        catch
+        {
+            response?.Dispose();
+            request.Dispose();
+            throw;
+        }
+    }
+
+    private sealed class WatchListUnsupportedException : Exception
+    {
+    }
 
     private async Task ListAsync(CancellationToken cancellationToken)
     {
@@ -273,99 +940,127 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         SetResourceTags(activity);
         activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
 
-        try
+        var nextCache = new Dictionary<NamespacedName, TResource>();
+        var listedItems = new List<TResource>();
+        var listResourceVersion = GetListResourceVersion();
+        string? nextResourceVersion = null;
+
+        if (_selector?.FieldSelector is not null)
+        {
+            SynchronizeStartedWithSelectorLog(Logger, typeof(TResource).Name, _selector.FieldSelector, null);
+        }
+        else
+        {
+            SynchronizeStartedLog(Logger, typeof(TResource).Name, null);
+        }
+
+        string? continueParameter = null;
+
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // request next page of items
+            using var listWithHttpMessage = await CreateListResponseAsync(
+                continueParameter,
+                string.IsNullOrEmpty(continueParameter) ? listResourceVersion : null,
+                cancellationToken).ConfigureAwait(false);
+
+            var list = listWithHttpMessage.Body;
+            foreach (var item in list.Items)
+            {
+                // These properties are not already set on items while listing
+                // assigned here for consistency
+                item.ApiVersion = _groupApiVersionKind.GroupApiVersion;
+                item.Kind = _groupApiVersionKind.Kind;
+
+                var key = NamespacedName.From(item);
+                nextCache[key] = item;
+                listedItems.Add(item);
+            }
+
+            // keep track of values needed for next page and to start watching
+            nextResourceVersion = list.ResourceVersion();
+            continueParameter = list.Continue();
+        }
+        while (!string.IsNullOrEmpty(continueParameter));
+
+        await CommitInitialCacheAsync(nextCache, listedItems, nextResourceVersion, activity).ConfigureAwait(false);
+
+        SynchronizeCompleteLog(Logger, typeof(TResource).Name, null);
+        activity?.SetStatus(ActivityStatusCode.Ok);
+        activity?.SetTag("k8s.informer.resource_count", nextCache.Count);
+    }
+
+    private async Task CommitInitialCacheAsync(
+        Dictionary<NamespacedName, TResource> nextCache,
+        IReadOnlyList<TResource> initialItems,
+        string? resourceVersion,
+        Activity? activity)
+    {
+        ImmutableList<Registration> registrations;
+        lock (_sync)
         {
             var previousCache = _cache;
-            _cache = [];
+            _cache = nextCache;
+            _lastResourceVersion = resourceVersion;
+            _lastResourceVersionUnavailable = false;
+            _initialListCompleted = true;
+            registrations = _registrations;
 
-            if (_selector?.FieldSelector is not null)
+            foreach (var item in initialItems)
             {
-                Logger.LogInformation(
-                    EventId(EventType.SynchronizeStarted),
-                    "Started synchronizing {ResourceType} resources from API server with field selector '{FieldSelector}'.",
-                    typeof(TResource).Name,
-                    _selector.FieldSelector);
-            }
-            else
-            {
-                Logger.LogInformation(
-                    EventId(EventType.SynchronizeStarted),
-                    "Started synchronizing {ResourceType} resources from API server.",
-                    typeof(TResource).Name);
+                // Existing cache entries are surfaced as modifications during a resync.
+                var eventType = previousCache.ContainsKey(NamespacedName.From(item))
+                    ? WatchEventType.Modified
+                    : WatchEventType.Added;
+                EnqueueRegistrationCallbacks(registrations, eventType, item);
             }
 
-            string? continueParameter = null;
-            do
+            foreach (var (key, item) in previousCache)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // request next page of items
-                using var listWithHttpMessage = await RetrieveResourceListAsync(continueParameter: continueParameter, resourceSelector: _selector, limit: _resourceListLimit, cancellationToken: cancellationToken).ConfigureAwait(false);
-
-                var list = listWithHttpMessage.Body;
-                foreach (var item in list.Items)
+                if (nextCache.ContainsKey(key))
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    // These properties are not already set on items while listing
-                    // assigned here for consistency
-                    item.ApiVersion = _groupApiVersionKind.GroupApiVersion;
-                    item.Kind = _groupApiVersionKind.Kind;
-
-                    var key = NamespacedName.From(item);
-                    _cache[key] = item?.Metadata?.OwnerReferences;
-
-                    var watchEventType = WatchEventType.Added;
-                    if (previousCache.Remove(key))
-                    {
-                        // an already-known key is provided as a modification for re-sync purposes
-                        watchEventType = WatchEventType.Modified;
-                    }
-
-                    InvokeRegistrationCallbacks(watchEventType, item);
+                    continue;
                 }
 
-                foreach (var (key, value) in previousCache)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    // for anything which was previously known but not part of list
-                    // send a deleted notification to clear any observer caches
-                    var item = new TResource()
-                    {
-                        ApiVersion = _groupApiVersionKind.GroupApiVersion,
-                        Kind = _groupApiVersionKind.Kind,
-                        Metadata = new V1ObjectMeta()
-                        {
-                            Name = key.Name,
-                            NamespaceProperty = key.Namespace,
-                            OwnerReferences = value
-                        }
-                    };
-
-                    InvokeRegistrationCallbacks(WatchEventType.Deleted, item);
-                }
-
-                // keep track of values needed for next page and to start watching
-                _lastResourceVersion = list.ResourceVersion();
-                continueParameter = list.Continue();
+                // Reuse the last-known object so delete handlers retain the resource's full state.
+                EnqueueRegistrationCallbacks(registrations, WatchEventType.Deleted, item);
             }
-            while (!string.IsNullOrEmpty(continueParameter));
 
-            Logger.LogInformation(
-                EventId(EventType.SynchronizeComplete),
-                "Completed synchronizing {ResourceType} resources from API server.",
-                typeof(TResource).Name);
-            activity?.SetStatus(ActivityStatusCode.Ok);
-            activity?.SetTag("k8s.informer.resource_count", _cache.Count);
+            foreach (var registration in registrations)
+            {
+                registration.EnqueueReady();
+            }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+
+        await Task.WhenAll(registrations.Select(registration => registration.InitialDeliveryTask)).ConfigureAwait(false);
+        activity?.SetTag("k8s.informer.resource_count", nextCache.Count);
+    }
+
+    private async Task<HttpOperationResponse<KubernetesList<TResource>>> CreateListResponseAsync(
+        string? continueParameter,
+        string? resourceVersion,
+        CancellationToken cancellationToken)
+    {
+        try
         {
+            return await CreateResponseAsync<KubernetesList<TResource>>(
+                watch: null,
+                limit: _resourceListLimit,
+                allowWatchBookmarks: null,
+                continueParameter: continueParameter,
+                resourceVersion: resourceVersion,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpOperationException exception) when (IsExpiredResourceVersion(exception))
+        {
+            MarkListResourceVersionUnavailable();
             throw;
         }
-        catch (Exception error)
+        catch (KubernetesException exception) when (IsExpiredResourceVersion(exception))
         {
-            InformerDiagnostics.RecordException(activity, error);
+            MarkListResourceVersionUnavailable();
             throw;
         }
     }
@@ -376,103 +1071,44 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         SetResourceTags(activity);
         activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
 
+        WatchingResourceLog(Logger, typeof(TResource).Name, _lastResourceVersion, null);
+
+        var lastEventUtc = _timeProvider.GetUtcNow();
+        using var reconnectCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var checkLastEventUtcTimer = _timeProvider.CreateTimer(_ =>
+        {
+            var lastEvent = _timeProvider.GetUtcNow() - lastEventUtc;
+            if (lastEvent > TimeSpan.FromMinutes(9.5))
+            {
+                lastEventUtc = DateTimeOffset.MaxValue;
+                DisposingWatcherLog(Logger, typeof(TResource).Name, null);
+                reconnectCancellationTokenSource.Cancel();
+            }
+        }, state: null, dueTime: TimeSpan.FromSeconds(45), period: TimeSpan.FromSeconds(45));
+
+        var watchWithHttpMessage = CreateResponseAsync<TResource>(
+            watch: true,
+            limit: null,
+            allowWatchBookmarks: true,
+            continueParameter: null,
+            resourceVersion: _lastResourceVersion,
+            cancellationToken: reconnectCancellationTokenSource.Token);
+
+#pragma warning disable CS0618 // Type or member is obsolete
         try
         {
-            Logger.LogInformation(
-                EventId(EventType.WatchingResource),
-                "Watching {ResourceType} starting from resource version {ResourceVersion}.",
-                typeof(TResource).Name,
-                _lastResourceVersion);
-
-            // completion source helps turn OnClose callback into something awaitable
-            var watcherCompletionSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            // begin watching where list left off
-            var watchWithHttpMessage = RetrieveResourceListAsync(watch: true, resourceVersion: _lastResourceVersion, resourceSelector: _selector, cancellationToken: cancellationToken);
-
-            var lastEventUtc = DateTime.UtcNow;
-#pragma warning disable CS0618 // Type or member is obsolete
-            using var watcher = watchWithHttpMessage.Watch<TResource, KubernetesList<TResource>>(
-                (watchEventType, item) =>
-                {
-                    if (!watcherCompletionSource.Task.IsCompleted)
-                    {
-                        lastEventUtc = DateTime.UtcNow;
-                        OnEvent(watchEventType, item);
-                    }
-                },
-                error =>
-                {
-                    if (error is KubernetesException kubernetesError)
-                    {
-                        // deal with this non-recoverable condition "too old resource version"
-                        if (string.Equals(kubernetesError.Status.Reason, "Expired", StringComparison.Ordinal))
-                        {
-                            // cause this error to surface
-                            watcherCompletionSource.TrySetException(error);
-                            ExceptionDispatchInfo.Capture(error).Throw();
-                        }
-                    }
-
-                    Logger.LogDebug(
-                        EventId(EventType.IgnoringError),
-                        "Ignoring error {ErrorType}: {ErrorMessage}",
-                        error.GetType().Name,
-                        error.Message);
-                },
-                () =>
-                {
-                    watcherCompletionSource.TrySetResult(0);
-                });
+            await foreach (var (eventType, resource) in watchWithHttpMessage.WatchAsync<TResource, TResource>((e) =>
 #pragma warning restore CS0618 // Type or member is obsolete
-
-            // reconnect if no events have arrived after a certain time
-            using var checkLastEventUtcTimer = new Timer(
-                _ =>
-                {
-                    var lastEvent = DateTime.UtcNow - lastEventUtc;
-                    if (lastEvent > TimeSpan.FromMinutes(9.5))
-                    {
-                        lastEventUtc = DateTime.MaxValue;
-                        Logger.LogDebug(
-                            EventId(EventType.DisposingToReconnect),
-                            "Disposing watcher for {ResourceType} to cause reconnect.",
-                            typeof(TResource).Name);
-
-                        watcherCompletionSource.TrySetCanceled();
-                        watcher.Dispose();
-                    }
-                },
-                state: null,
-                dueTime: TimeSpan.FromSeconds(45),
-                period: TimeSpan.FromSeconds(45));
-
-            using var registration = cancellationToken.Register(watcher.Dispose);
-            try
             {
-                await watcherCompletionSource.Task.ConfigureAwait(false);
-            }
-            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+                ExceptionDispatchInfo.Capture(e).Throw();
+            }, reconnectCancellationTokenSource.Token))
             {
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception error)
-            {
-                InformerDiagnostics.RecordException(activity, error);
-                throw;
+                lastEventUtc = _timeProvider.GetUtcNow();
+                OnEvent(eventType, resource);
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (reconnectCancellationTokenSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            throw;
-        }
-        catch (Exception error)
-        {
-            InformerDiagnostics.RecordException(activity, error);
-            throw;
         }
     }
 
@@ -485,23 +1121,29 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         activity?.SetTag("k8s.resource.namespace", item.Namespace());
         activity?.SetTag("k8s.resource.version", item.ResourceVersion());
 
-        try
+        InformerWatchEventLog(
+            Logger,
+            typeof(TResource).Name,
+            watchEventType,
+            item.Kind,
+            item.Name(),
+            item.Namespace(),
+            item.ResourceVersion(),
+            null);
+
+        ImmutableList<Registration> registrations;
+        lock (_sync)
         {
-            Logger.LogDebug(
-                EventId(EventType.InformerWatchEvent),
-                "Informer {ResourceType} received {WatchEventType} notification for {ItemKind}/{ItemName}.{ItemNamespace} at resource version {ResourceVersion}",
-                typeof(TResource).Name,
-                watchEventType,
-                item.Kind,
-                item.Name(),
-                item.Namespace(),
-                item.ResourceVersion());
+            if (_disposed)
+            {
+                return;
+            }
 
             if (watchEventType == WatchEventType.Added ||
                 watchEventType == WatchEventType.Modified)
             {
                 // BUGBUG: log warning if cache was not in expected state
-                _cache[NamespacedName.From(item)] = item.Metadata?.OwnerReferences;
+                _cache[NamespacedName.From(item)] = item;
             }
 
             if (watchEventType == WatchEventType.Deleted)
@@ -517,17 +1159,14 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
                 _lastResourceVersion = item.ResourceVersion();
             }
 
+            registrations = _registrations;
+
             if (watchEventType == WatchEventType.Added ||
                 watchEventType == WatchEventType.Modified ||
                 watchEventType == WatchEventType.Deleted)
             {
-                InvokeRegistrationCallbacks(watchEventType, item);
+                EnqueueRegistrationCallbacks(registrations, watchEventType, item);
             }
-        }
-        catch (Exception error)
-        {
-            InformerDiagnostics.RecordException(activity, error);
-            throw;
         }
     }
 
@@ -541,71 +1180,14 @@ public class ResourceInformer<TResource> : BackgroundHostedService, IResourceInf
         activity?.SetTag("k8s.namespace.name", _namespace);
     }
 
-    private void InvokeRegistrationCallbacks(WatchEventType eventType, TResource resource)
+    private static void EnqueueRegistrationCallbacks(ImmutableList<Registration> registrations, WatchEventType eventType, TResource resource)
     {
-        List<Exception>? innerExceptions = default;
-
-        foreach (var registration in _registrations)
+        foreach (var registration in registrations)
         {
-            try
-            {
-                registration.Callback.Invoke(eventType, resource);
-            }
-            catch (Exception innerException)
-            {
-                innerExceptions ??= [];
-                innerExceptions.Add(innerException);
-            }
-        }
-
-        if (innerExceptions is not null)
-        {
-            throw new AggregateException("One or more exceptions thrown by ResourceInformerCallback.", innerExceptions);
+            registration.Enqueue(eventType, resource);
         }
     }
 
-    internal class Registration : IResourceInformerRegistration
-    {
-        private bool _disposedValue;
-
-        public Registration(ResourceInformer<TResource> resourceInformer, ResourceInformerCallback<TResource> callback)
-        {
-            ResourceInformer = resourceInformer;
-            Callback = callback;
-            lock (resourceInformer._sync)
-            {
-                resourceInformer._registrations = resourceInformer._registrations.Add(this);
-            }
-        }
-
-        ~Registration()
-        {
-            // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
-            Dispose(disposing: false);
-        }
-
-        public ResourceInformer<TResource> ResourceInformer { get; }
-        public ResourceInformerCallback<TResource> Callback { get; }
-
-        public Task ReadyAsync(CancellationToken cancellationToken) => ResourceInformer.ReadyAsync(cancellationToken);
-
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposedValue)
-            {
-                lock (ResourceInformer._sync)
-                {
-                    ResourceInformer._registrations = ResourceInformer._registrations.Remove(this);
-                }
-                _disposedValue = true;
-            }
-        }
-
-        public void Dispose()
-        {
-            // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
-            Dispose(disposing: true);
-            GC.SuppressFinalize(this);
-        }
-    }
+    private void ReportCallbackFailure(Exception error)
+        => CallbackFailedLog(Logger, typeof(TResource).Name, error);
 }
