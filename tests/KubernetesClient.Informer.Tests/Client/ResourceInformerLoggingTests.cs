@@ -21,7 +21,6 @@ public class ResourceInformerLoggingTests
     [Theory]
     [InlineData((int)HttpStatusCode.ServiceUnavailable, "InternalError", LogLevel.Warning)]
     [InlineData((int)HttpStatusCode.TooManyRequests, "TooManyRequests", LogLevel.Warning)]
-    [InlineData((int)HttpStatusCode.Forbidden, "Forbidden", LogLevel.Error)]
     [InlineData((int)HttpStatusCode.Gone, "Expired", LogLevel.Information)]
     public async Task ListFailuresAreLoggedAtSeverityMatchingTheirImpact(
         int statusCode,

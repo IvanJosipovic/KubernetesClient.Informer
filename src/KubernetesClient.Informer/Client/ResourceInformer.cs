@@ -317,7 +317,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                         _runInfiniteInvocation.Value = false;
                     }
                 }
-                catch (Exception error) when (!cancellationToken.IsCancellationRequested && error is not OperationCanceledException)
+                catch (Exception error) when (!cancellationToken.IsCancellationRequested
+                    && error is not OperationCanceledException
+                    && IsRetryable(error))
                 {
                     Status = ResourceInformerStatus.Retrying;
                     var retryDelay = GetRetryDelay(error, retryAttempt++, _timeProvider);
@@ -346,6 +348,15 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         {
             _ready.TrySetException(error);
             Status = ResourceInformerStatus.Faulted;
+            if (!IsRetryable(error))
+            {
+                Logger.LogError(
+                    EventId(EventType.WatchingFailed),
+                    error,
+                    "Failed while watching {ResourceType} resources from API server.",
+                    typeof(TResource).Name);
+            }
+
             throw;
         }
         finally
@@ -434,6 +445,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             }
             catch (HttpOperationException ex)
             {
+                if (!IsRetryable(ex))
+                {
+                    throw;
+                }
+
                 Status = ResourceInformerStatus.Retrying;
 
                 if (IsExpiredResourceVersion(ex))
@@ -446,6 +462,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             }
             catch (KubernetesException ex)
             {
+                if (!IsRetryable(ex))
+                {
+                    throw;
+                }
+
                 Status = ResourceInformerStatus.Retrying;
 
                 // Resource version expiry requires a full re-sync so no updates are missed.
@@ -658,6 +679,24 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private static bool IsExpiredResourceVersion(HttpOperationException exception)
         => exception.Response?.StatusCode == HttpStatusCode.Gone;
+
+    private static bool IsRetryable(HttpOperationException exception)
+        => IsRetryableStatusCode((int?)exception.Response?.StatusCode);
+
+    private static bool IsRetryable(KubernetesException exception)
+        => IsExpiredResourceVersion(exception) || IsRetryableStatusCode(exception.Status?.Code);
+
+    private static bool IsRetryable(Exception exception)
+        => exception switch
+        {
+            HttpOperationException httpException => IsRetryable(httpException),
+            KubernetesException kubernetesException => IsRetryable(kubernetesException),
+            _ => true,
+        };
+
+    private static bool IsRetryableStatusCode(int? statusCode)
+        => statusCode is (int)HttpStatusCode.Gone or (int)HttpStatusCode.TooManyRequests
+            || statusCode >= 500;
 
     private string? GetListResourceVersion()
     {
@@ -901,7 +940,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             // request next page of items
             using var listWithHttpMessage = await CreateListResponseAsync(
                 continueParameter,
-                listResourceVersion,
+                string.IsNullOrEmpty(continueParameter) ? listResourceVersion : null,
                 cancellationToken).ConfigureAwait(false);
 
             var list = listWithHttpMessage.Body;

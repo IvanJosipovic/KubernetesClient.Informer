@@ -426,7 +426,7 @@ public class ResourceInformerTests
                 It.IsAny<string>(),
                 It.IsAny<string>(),
                 It.IsAny<int?>(),
-                It.Is<string?>(resourceVersion => resourceVersion == "0"),
+                It.IsAny<string>(),
                 It.IsAny<string>(),
                 It.IsAny<int?>(),
                 It.IsAny<bool?>(),
@@ -495,7 +495,7 @@ public class ResourceInformerTests
             .ToArray();
         Assert.Equal(2, listRequests.Length);
         Assert.Equal(new string?[] { null, "next" }, listRequests.Select(invocation => invocation.Arguments[4] as string));
-        Assert.Equal(new string?[] { "0", "0" }, listRequests.Select(invocation => invocation.Arguments[8] as string));
+        Assert.Equal(new string?[] { "0", null }, listRequests.Select(invocation => invocation.Arguments[8] as string));
         Assert.All(listRequests, invocation => Assert.Equal(1000, invocation.Arguments[7]));
     }
 
@@ -908,6 +908,7 @@ public class ResourceInformerTests
         var relistEventsDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var listRequestCount = 0;
         var callbackCount = 0;
+        var requestedResourceVersions = new List<string?>();
         var existing = new V1Pod
         {
             Metadata = new V1ObjectMeta
@@ -968,7 +969,8 @@ public class ResourceInformerTests
                 6 => Task.FromResult(CreatePodListResponse([added], "2")),
                 _ => Task.FromException<HttpOperationResponse<KubernetesList<V1Pod>>>(
                     new InvalidOperationException("Unexpected list request.")),
-            });
+            },
+            requestedResourceVersions: requestedResourceVersions);
         SetupPodWatchException(customObjects, CreateHttpOperationException(HttpStatusCode.Gone));
 
         var kubernetes = new Mock<IKubernetes>();
@@ -1032,6 +1034,7 @@ public class ResourceInformerTests
         Assert.Equal("new", events[2].Resource.Metadata.Labels["generation"]);
         Assert.Same(removed, events[4].Resource);
         Assert.Equal(6, listRequestCount);
+        Assert.Equal(new string?[] { "0", null, "1", null, "1", null }, requestedResourceVersions);
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
@@ -2884,10 +2887,9 @@ public class ResourceInformerTests
     }
 
     [Fact]
-    public async Task ForbiddenKubernetesStatusDuringListIsRetried()
+    public async Task ForbiddenKubernetesStatusDuringListFaultsInformer()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var timeProvider = new TestTimeProvider();
         var customObjects = new Mock<ICustomObjectsOperations>();
         var exception = new KubernetesException(new V1Status
         {
@@ -2904,28 +2906,23 @@ public class ResourceInformerTests
                 2 => Task.FromResult(CreateEmptyPodListResponse()),
                 _ => Task.FromException<HttpOperationResponse<KubernetesList<V1Pod>>>(new InvalidOperationException("Unexpected list request.")),
             });
-        SetupPodWatchException(customObjects, new HttpRequestException("Stop test watch."));
-
         var kubernetes = new Mock<IKubernetes>();
         kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
 
         using var informer = new ResourceInformer<V1Pod>(
             kubernetes.Object,
             Mock.Of<IHostApplicationLifetime>(),
-            NullLogger<ResourceInformer<V1Pod>>.Instance,
-            timeProvider: timeProvider);
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
 
         var runTask = informer.RunAsync(cancellation.Token);
         informer.StartWatching();
 
-        await timeProvider.WaitForTimerCountAsync(1, cancellation.Token).DefaultTimeout();
-        timeProvider.FireTimer(0);
-        await informer.ReadyAsync(cancellation.Token).DefaultTimeout();
-        Assert.Equal(2, listRequestCount);
+        var thrown = await Assert.ThrowsAsync<KubernetesException>(
+            () => runTask.WaitAsync(cancellation.Token).DefaultTimeout());
 
-        cancellation.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
-        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
+        Assert.Same(exception, thrown);
+        Assert.Equal(1, listRequestCount);
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
     }
 
     [Fact]
@@ -3447,27 +3444,20 @@ public class ResourceInformerTests
     }
 
     [Fact]
-    public async Task ForbiddenHttpOperationExceptionDuringWatchIsRetried()
+    public async Task ForbiddenHttpOperationExceptionDuringWatchFaultsInformer()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var timeProvider = new TestTimeProvider();
         var listRequestCount = 0;
         var requestedWatchResourceVersions = new List<string?>();
 
         var customObjects = new Mock<ICustomObjectsOperations>();
         SetupPodListRequest(customObjects, () => Interlocked.Increment(ref listRequestCount));
-        var secondWatchRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var watchRequestCount = 0;
+        var error = CreateHttpOperationException(HttpStatusCode.Forbidden);
         SetupPodWatchException(
             customObjects,
-            CreateHttpOperationException(HttpStatusCode.Forbidden),
-            () =>
-            {
-                if (Interlocked.Increment(ref watchRequestCount) == 2)
-                {
-                    secondWatchRequested.TrySetResult();
-                }
-            },
+            error,
+            () => Interlocked.Increment(ref watchRequestCount),
             requestedWatchResourceVersions);
 
         var kubernetes = new Mock<IKubernetes>();
@@ -3476,22 +3466,47 @@ public class ResourceInformerTests
         using var informer = new ResourceInformer<V1Pod>(
             kubernetes.Object,
             Mock.Of<IHostApplicationLifetime>(),
-            NullLogger<ResourceInformer<V1Pod>>.Instance,
-            timeProvider: timeProvider);
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
 
         var runTask = informer.RunAsync(cancellation.Token);
         informer.StartWatching();
 
-        await timeProvider.WaitForTimerCountAsync(2, cancellation.Token).DefaultTimeout();
-        timeProvider.FireTimer(1);
-        await secondWatchRequested.Task.WaitAsync(cancellation.Token).DefaultTimeout();
-        cancellation.Cancel();
-
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
-        Assert.Equal(2, watchRequestCount);
+        var thrown = await Assert.ThrowsAsync<HttpOperationException>(
+            () => runTask.WaitAsync(cancellation.Token).DefaultTimeout());
+        Assert.Same(error, thrown);
+        Assert.Equal(1, watchRequestCount);
         Assert.Equal(1, listRequestCount);
-        Assert.Equal(["1", "1"], requestedWatchResourceVersions);
-        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
+        Assert.Equal(["1"], requestedWatchResourceVersions);
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
+    }
+
+    [Fact]
+    public async Task RunInfiniteFaultsForNonRetryableKubernetesStatus()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var error = new KubernetesException(new V1Status
+        {
+            Code = (int)HttpStatusCode.Forbidden,
+            Reason = "Forbidden",
+        });
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        SetupPodListRequest(customObjects, responseFactory: () => throw error);
+
+        var kubernetes = new Mock<IKubernetes>();
+        kubernetes.SetupGet(client => client.CustomObjects).Returns(customObjects.Object);
+        using var informer = new ResourceInformer<V1Pod>(
+            kubernetes.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+
+        var thrown = await Assert.ThrowsAsync<KubernetesException>(
+            () => informer.RunInfinite(cancellation.Token).WaitAsync(cancellation.Token).DefaultTimeout());
+
+        Assert.Same(error, thrown);
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
+        Assert.Single(customObjects.Invocations, invocation =>
+            invocation.Method.Name == nameof(ICustomObjectsOperations.ListClusterCustomObjectWithHttpMessagesAsync)
+            && invocation.Method.GetGenericArguments().Single() == typeof(KubernetesList<V1Pod>));
     }
 
     [Fact]

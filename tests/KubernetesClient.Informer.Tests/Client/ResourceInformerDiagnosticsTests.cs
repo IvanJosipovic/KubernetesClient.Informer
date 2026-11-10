@@ -83,7 +83,10 @@ public class ResourceInformerDiagnosticsTests
         var runActivity = Assert.Single(recordedActivities, activity => activity.DisplayName == nameof(ResourceInformer<V1Pod>.RunAsync));
         var listActivity = Assert.Single(recordedActivities, activity => activity.DisplayName == "ListAsync");
         var eventActivity = Assert.Single(recordedActivities, activity => activity.DisplayName == "OnEvent");
-        var watchActivity = Assert.Single(recordedActivities, activity => activity.DisplayName == "WatchAsync");
+        var watchActivity = recordedActivities
+            .Where(activity => activity.DisplayName == "WatchAsync")
+            .OrderBy(activity => activity.StartTimeUtc)
+            .First();
 
         Assert.Equal(ActivityKind.Consumer, runActivity.Kind);
         Assert.Equal("V1Pod", runActivity.GetTagItem("k8s.resource.type"));

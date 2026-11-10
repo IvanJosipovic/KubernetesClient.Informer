@@ -4,7 +4,7 @@ These diagrams describe `ResourceInformer<TResource>` only; they exclude host st
 
 ## `RunAsync`
 
-`RunAsync` waits for `StartWatching()` before requesting resources. It publishes the initial cache and completes `ReadyAsync()` only after every list page succeeds and initial callbacks finish. A failed page publishes neither partial cache contents nor callbacks; the whole list is retried. HTTP and Kubernetes status failures are retried regardless of status code. Resource-version expiry triggers a relist. Retry delays use bounded exponential backoff with jitter and honor Kubernetes `Retry-After` where available. A watch lasting at least one minute is considered sustained and resets the consecutive retry backoff if it then fails; normal watch completion also resets it.
+`RunAsync` waits for `StartWatching()` before requesting resources. It publishes the initial cache and completes `ReadyAsync()` only after every list page succeeds and initial callbacks finish. A failed page publishes neither partial cache contents nor callbacks; retryable failures restart the whole list. HTTP and Kubernetes status failures with status 429 or 5xx are retried; status 410 triggers a full relist, while other status failures fault the run. Retry delays use bounded exponential backoff with jitter and honor Kubernetes `Retry-After` where available. A watch lasting at least one minute is considered sustained and resets the consecutive retry backoff if it then fails; normal watch completion also resets it.
 
 ```mermaid
 flowchart TD
@@ -39,7 +39,7 @@ flowchart TD
 
 ## `RunInfinite`
 
-`RunInfinite` calls `StartWatching()` and repeatedly invokes `RunAsync`. List/watch exceptions are normally retried inside `RunAsync`; any non-cancellation exception that escapes is logged once with EventId 110 and retried with bounded backoff. The retry log uses the same severity classifier as list/watch failures. Cancellation by the supplied token stops the informer; an unrelated `OperationCanceledException` is treated as a fault and escapes.
+`RunInfinite` calls `StartWatching()` and repeatedly invokes `RunAsync`. Retryable list/watch failures are normally handled inside `RunAsync`; any other retryable non-cancellation exception that escapes is logged once with EventId 110 and retried with bounded backoff. Non-retryable HTTP or Kubernetes status failures fault the run instead of being retried. The retry log uses the same severity classifier as list/watch failures. Cancellation by the supplied token stops the informer; an unrelated `OperationCanceledException` is treated as a fault and escapes.
 
 ```mermaid
 flowchart TD
