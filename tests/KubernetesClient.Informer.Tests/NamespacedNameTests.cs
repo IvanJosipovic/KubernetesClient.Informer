@@ -30,8 +30,6 @@ public class NamespacedNameTests
     [InlineData("ns", "n1", "ns", "n1", true)]
     [InlineData("ns", "n1", "ns", "n2", false)]
     [InlineData("ns", "n1", "ns-x", "n1", false)]
-    [InlineData(null, "n1", null, "n1", true)]
-    [InlineData(null, "n1", null, "n2", false)]
     public void EqualityAndInequality(
         string namespace1,
         string name1,
@@ -57,6 +55,19 @@ public class NamespacedNameTests
         Assert.False(sameNotEqual1);
         Assert.True(sameEqual2);
         Assert.False(sameNotEqual2);
+    }
+
+    [Fact]
+    public void ClusterScopedNamesCompareByName()
+    {
+        var first = new NamespacedName("n1");
+        var same = new NamespacedName("n1");
+        var different = new NamespacedName("n2");
+
+        Assert.True(first == same);
+        Assert.False(first != same);
+        Assert.False(first == different);
+        Assert.True(first != different);
     }
 
     [Fact]
