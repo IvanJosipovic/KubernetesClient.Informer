@@ -510,7 +510,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "MODIFIED",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -618,7 +618,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.EnqueueListResponse(new ListResult
         {
             ResourceVersion = "2",
-            Continue = null!,
+            Continue = null,
             Items =
             [
                 new ResourceObject
@@ -698,7 +698,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.EnqueueListResponse(new ListResult
         {
             ResourceVersion = "2",
-            Continue = null!,
+            Continue = null,
             Items =
             [
                 new ResourceObject
@@ -759,7 +759,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.EnqueueListResponse(new ListResult
         {
             ResourceVersion = "11",
-            Continue = null!,
+            Continue = null,
             Items = [new ResourceObject
             {
                 ApiVersion = "v1",
@@ -1175,7 +1175,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "BOOKMARK",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -1212,7 +1212,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "MODIFIED",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -1282,7 +1282,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "ERROR",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Status",
@@ -1353,7 +1353,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "ADDED",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -1363,7 +1363,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "MODIFIED",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -1373,7 +1373,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "DELETED",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -1421,7 +1421,7 @@ public class ResourceInformerTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "DELETED",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -1612,7 +1612,7 @@ public class ResourceInformerTests
             .Build();
 
         var informer = (ResourceInformer<V1Pod>)testHost.Services.GetRequiredService<IResourceInformer<V1Pod>>();
-        using var registration = informer.Register((WatchEventType eventType, V1Pod pod) => throw new ApplicationException("boom"));
+        using var registration = informer.Register((WatchEventType eventType, V1Pod pod) => throw new InvalidOperationException("boom"));
         var healthyCallbackCalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var healthyRegistration = informer.Register((WatchEventType eventType, V1Pod pod) => healthyCallbackCalled.TrySetResult());
 
@@ -1625,7 +1625,7 @@ public class ResourceInformerTests
         await healthyRegistration.ReadyAsync(cancellation.Token).DefaultTimeout();
         await healthyCallbackCalled.Task.DefaultTimeout();
 
-        var ex = await Assert.ThrowsAsync<ApplicationException>(() => registration.ReadyAsync(cancellation.Token));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => registration.ReadyAsync(cancellation.Token));
         Assert.Equal("boom", ex.Message);
         Assert.False(runTask.IsCompleted);
 
@@ -3114,7 +3114,7 @@ public class ResourceInformerTests
         {
             await startRace.Task;
             informer.Dispose();
-        });
+        }, TestContext.Current.CancellationToken);
 
         startRace.TrySetResult();
         var registrationResults = await Task.WhenAll(registrations);
@@ -3213,7 +3213,7 @@ public class ResourceInformerTests
         var firstWatch = await clusterHost.Cluster.WaitForWatchRequestAsync(1).WaitAsync(cancellation.Token).DefaultTimeout();
         var secondWatch = await clusterHost.Cluster.WaitForWatchRequestAsync(2).WaitAsync(cancellation.Token).DefaultTimeout();
 
-        Assert.Equal(1, clusterHost.Cluster.ListRequests.Count);
+        Assert.Single(clusterHost.Cluster.ListRequests);
         Assert.Equal(firstWatch.ResourceVersion, secondWatch.ResourceVersion);
         Assert.Equal("0", firstWatch.ResourceVersion);
 
@@ -3343,7 +3343,7 @@ public class ResourceInformerTests
             clusterHost.Cluster.WatchEvents.Add(new WatchEvent
             {
                 Type = "MODIFIED",
-                Object = new ResourceObject
+                Resource = new ResourceObject
                 {
                     ApiVersion = "v1",
                     Kind = "Pod",

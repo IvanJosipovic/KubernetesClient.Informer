@@ -42,7 +42,7 @@ public class ResourceInformerDiagnosticsTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "MODIFIED",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Pod",
@@ -116,7 +116,7 @@ public class ResourceInformerDiagnosticsTests
         clusterHost.Cluster.WatchEvents.Add(new WatchEvent
         {
             Type = "ERROR",
-            Object = new ResourceObject
+            Resource = new ResourceObject
             {
                 ApiVersion = "v1",
                 Kind = "Status",

@@ -37,7 +37,7 @@ internal static class TaskExtensions
     }
 
     private static async Task<T> TimeoutAfter<T>(this Task<T> task, TimeSpan timeout,
-        [CallerFilePath] string filePath = null,
+        [CallerFilePath] string? filePath = null,
         [CallerLineNumber] int lineNumber = default)
     {
         // Don't create a timer if the task is already completed
@@ -58,7 +58,7 @@ internal static class TaskExtensions
     }
 
     private static async Task TimeoutAfter(this Task task, TimeSpan timeout,
-        [CallerFilePath] string filePath = null,
+        [CallerFilePath] string? filePath = null,
         [CallerLineNumber] int lineNumber = default)
     {
         // Don't create a timer if the task is already completed
@@ -69,7 +69,7 @@ internal static class TaskExtensions
             return;
         }
 
-        var cts = new CancellationTokenSource();
+        using var cts = new CancellationTokenSource();
         if (task == await Task.WhenAny(task, Task.Delay(timeout, cts.Token)))
         {
             cts.Cancel();
@@ -81,7 +81,7 @@ internal static class TaskExtensions
         }
     }
 
-    private static string CreateMessage(TimeSpan timeout, string filePath, int lineNumber)
+    private static string CreateMessage(TimeSpan timeout, string? filePath, int lineNumber)
         => string.IsNullOrEmpty(filePath)
         ? $"The operation timed out after reaching the limit of {timeout.TotalMilliseconds}ms."
         : $"The operation at {filePath}:{lineNumber} timed out after reaching the limit of {timeout.TotalMilliseconds}ms.";

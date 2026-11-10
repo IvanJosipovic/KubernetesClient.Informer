@@ -17,6 +17,7 @@ public sealed class FakeServer : IServer
     }
 
     public Task StartAsync<TContext>(IHttpApplication<TContext> application, CancellationToken cancellationToken)
+        where TContext : notnull
     {
         return Task.CompletedTask;
     }

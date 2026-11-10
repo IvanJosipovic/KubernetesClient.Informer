@@ -8,8 +8,8 @@ namespace KubernetesClient.Informer.Tests.TestCluster.Models;
 public class WatchEvent
 {
     [JsonPropertyName("type")]
-    public string Type { get; set; }
+    public string Type { get; set; } = string.Empty;
 
     [JsonPropertyName("object")]
-    public ResourceObject Object { get; set; }
+    public ResourceObject Resource { get; set; } = new();
 }

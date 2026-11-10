@@ -15,7 +15,7 @@ public class TestLatch
     {
         _completion.SetResult(false);
     }
-    public void Throw(ApplicationException exception)
+    public void Throw(Exception exception)
     {
         _completion.SetException(exception);
     }

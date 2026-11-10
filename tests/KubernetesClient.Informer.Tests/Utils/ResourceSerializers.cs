@@ -32,16 +32,16 @@ public static class ResourceSerializers
     {
         var json = JsonSerializer.Serialize(resource, _jsonOptions);
 
-        return JsonSerializer.Deserialize<TResource>(json, _jsonOptions);
+        return JsonSerializer.Deserialize<TResource>(json, _jsonOptions)
+            ?? throw new JsonException($"The JSON representation could not be deserialized as {typeof(TResource)}.");
     }
 
-    private class NonStringScalarTypeResolver : INodeTypeResolver
+    private sealed class NonStringScalarTypeResolver : INodeTypeResolver
     {
-        bool INodeTypeResolver.Resolve(NodeEvent nodeEvent, ref Type currentType)
+        bool INodeTypeResolver.Resolve(NodeEvent? nodeEvent, ref Type currentType)
         {
-            if (currentType == typeof(object) && nodeEvent is Scalar)
+            if (currentType == typeof(object) && nodeEvent is Scalar scalar)
             {
-                var scalar = nodeEvent as Scalar;
                 if (scalar.IsPlainImplicit)
                 {
                     // TODO: should use the correct boolean parser (which accepts yes/no) instead of bool.tryparse

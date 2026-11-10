@@ -15,7 +15,7 @@ namespace KubernetesClient.Informer.Tests.TestCluster;
 
 public class TestClusterHostBuilder
 {
-    private readonly IHostBuilder _hostBuilder = new HostBuilder();
+    private readonly HostBuilder _hostBuilder = new();
 
     public ITestClusterHost Build()
     {
@@ -118,8 +118,10 @@ public class TestClusterHostBuilder
     {
         using var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
         socket.Bind(new IPEndPoint(IPAddress.Any, 0));
-        return ((IPEndPoint)socket.LocalEndPoint).Port;
+        return socket.LocalEndPoint is IPEndPoint endpoint
+            ? endpoint.Port
+            : throw new InvalidOperationException("The socket has no local endpoint.");
     }
 
-    public string ServerUrl { get; set; }
+    public string ServerUrl { get; set; } = string.Empty;
 }

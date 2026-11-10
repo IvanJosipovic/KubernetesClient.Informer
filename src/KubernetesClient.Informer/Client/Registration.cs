@@ -10,7 +10,7 @@ namespace KubernetesClient.Informer.Client;
 
 public partial class ResourceInformer<TResource> where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
-    internal class Registration : IResourceInformerRegistration
+    internal sealed class Registration : IResourceInformerRegistration
     {
         private readonly Channel<Notification> _notifications = Channel.CreateUnbounded<Notification>(new UnboundedChannelOptions
         {
@@ -115,7 +115,7 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
             await _ready.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        protected virtual void Dispose(bool disposing)
+        private void Dispose(bool disposing)
         {
             if (Interlocked.Exchange(ref _disposedValue, 1) == 0)
             {

@@ -1,5 +1,12 @@
+using k8s;
 using k8s.Models;
 using KubernetesClient.Informer.Client;
+using System;
+
+var logPodEvent = LoggerMessage.Define<WatchEventType, string?, string?>(
+    LogLevel.Information,
+    new EventId(0, "PodEvent"),
+    "{EventType}: {Namespace}/{PodName}");
 
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -14,7 +21,7 @@ var logger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Po
 
 using var registration = podInformer.Register((eventType, pod) =>
 {
-    logger.LogInformation("{EventType}: {Namespace}/{PodName}", eventType, pod.Metadata?.NamespaceProperty, pod.Metadata?.Name);
+    logPodEvent(logger, eventType, pod.Metadata?.NamespaceProperty, pod.Metadata?.Name, null);
 });
 
 await host.RunAsync();

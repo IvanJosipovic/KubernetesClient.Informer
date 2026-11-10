@@ -32,6 +32,9 @@ public class HostedServiceAdapter<TService> : IHostedService
         _startWatchingOnHostStart = startWatchingOnHostStart;
     }
 
+    /// <summary>Starts the wrapped service.</summary>
+    /// <param name="cancellationToken">A token that can be used to cancel the start operation.</param>
+    /// <returns>A task that represents the asynchronous start operation.</returns>
     public Task StartAsync(CancellationToken cancellationToken)
     {
         if (_startWatchingOnHostStart && _service is IResourceInformer informer)
@@ -42,5 +45,8 @@ public class HostedServiceAdapter<TService> : IHostedService
         return _service.StartAsync(cancellationToken);
     }
 
+    /// <summary>Stops the wrapped service.</summary>
+    /// <param name="cancellationToken">A token that can be used to cancel the stop operation.</param>
+    /// <returns>A task that represents the asynchronous stop operation.</returns>
     public Task StopAsync(CancellationToken cancellationToken) => _service.StopAsync(cancellationToken);
 }

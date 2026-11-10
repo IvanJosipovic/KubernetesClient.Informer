@@ -31,7 +31,10 @@ public static class KubernetesCoreExtensions
             {
                 var options = sp.GetRequiredService<IOptions<KubernetesClientOptions>>().Value;
 
-                return new k8s.Kubernetes(options.Configuration);
+                var configuration = options.Configuration
+                    ?? throw new InvalidOperationException("The Kubernetes client configuration has not been set.");
+
+                return new k8s.Kubernetes(configuration);
             });
         }
 

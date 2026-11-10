@@ -104,7 +104,7 @@ public class TestTimeProvider : TimeProvider
         }
     }
 
-    public override ITimer CreateTimer(TimerCallback callback, object state, TimeSpan dueTime, TimeSpan period)
+    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         var timer = new TestTimer(callback, state, dueTime, period);
         List<TaskCompletionSource> completedWaiters;
@@ -191,7 +191,7 @@ public class TestTimeProvider : TimeProvider
 
     private sealed class TestTimer : ITimer
     {
-        public TestTimer(TimerCallback callback, object state, TimeSpan dueTime, TimeSpan period)
+        public TestTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
         {
             Callback = callback;
             State = state;
@@ -205,7 +205,7 @@ public class TestTimeProvider : TimeProvider
 
         public TimerCallback Callback { get; private set; }
 
-        public object State { get; private set; }
+        public object? State { get; private set; }
 
         public bool IsDisposed { get; private set; }
 

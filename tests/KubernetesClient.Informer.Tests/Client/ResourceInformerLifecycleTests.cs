@@ -22,7 +22,7 @@ public class ResourceInformerLifecycleTests
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => informer.RunAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5)));
+            () => informer.RunAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -37,7 +37,7 @@ public class ResourceInformerLifecycleTests
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -50,9 +50,9 @@ public class ResourceInformerLifecycleTests
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+            () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -64,11 +64,11 @@ public class ResourceInformerLifecycleTests
         informer.StartWatching();
         cancellation.Cancel();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
 
         using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((_, _) => { }));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => registration.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+            () => registration.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -83,7 +83,7 @@ public class ResourceInformerLifecycleTests
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -104,11 +104,11 @@ public class ResourceInformerLifecycleTests
         using var informer = new CancellationAwareInformer();
         var runTask = informer.RunInfinite(cancellation.Token);
 
-        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.Equal(cancellation.Token, informer.ObservedToken);
 
         cancellation.Cancel();
-        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
     }
 
     [Fact]
@@ -118,9 +118,9 @@ public class ResourceInformerLifecycleTests
         using var informer = new CancellationAwareInformer();
         var runTask = informer.RunInfinite(cancellation.Token);
 
-        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         cancellation.Cancel();
-        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.Equal(1, informer.RunCount);
         Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
@@ -169,7 +169,7 @@ public class ResourceInformerLifecycleTests
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => informer.ReadyAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5)));
+            () => informer.ReadyAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -177,12 +177,12 @@ public class ResourceInformerLifecycleTests
     {
         using var informer = new DisposableAwareInformer();
         await informer.StartAsync(CancellationToken.None);
-        await informer.RunStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await informer.RunStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         informer.Dispose();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => informer.RunTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => informer.RunTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -191,10 +191,10 @@ public class ResourceInformerLifecycleTests
         using var cancellation = new CancellationTokenSource();
         using var dependencyCancellation = new CancellationTokenSource();
         var logger = new RecordingLogger();
-        using var informer = new UnexpectedCancellationInformer(dependencyCancellation.Token, logger);
+        using var informer = new UnexpectedCancellationInformer(logger, dependencyCancellation.Token);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => informer.RunInfinite(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5)));
+            () => informer.RunInfinite(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
 
         Assert.False(logger.RetryWasLogged);
         Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
@@ -217,7 +217,7 @@ public class ResourceInformerLifecycleTests
         await informer.SecondRunStarted.Task.WaitAsync(cancellation.Token).DefaultTimeout();
 
         cancellation.Cancel();
-        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.Equal(2, informer.RunCount);
         Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
@@ -234,12 +234,12 @@ public class ResourceInformerLifecycleTests
         cancellation.Cancel();
         using var informer = new CancellationAwareInformer();
 
-        await informer.RunInfinite(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5));
+        await informer.RunInfinite(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.Equal(0, informer.RunCount);
         Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+            () => informer.ReadyAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -248,13 +248,13 @@ public class ResourceInformerLifecycleTests
         using var cancellation = new CancellationTokenSource();
         using var informer = new CancellationAwareInformer();
         var runTask = informer.RunInfinite(cancellation.Token);
-        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => informer.RunInfinite(CancellationToken.None));
 
         cancellation.Cancel();
-        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.Equal(1, informer.RunCount);
     }
 
@@ -269,7 +269,7 @@ public class ResourceInformerLifecycleTests
             () => informer.RunInfinite(CancellationToken.None));
 
         cancellation.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     private static ResourceInformer<V1Pod> CreateInformer()
@@ -363,8 +363,8 @@ public class ResourceInformerLifecycleTests
         private readonly CancellationToken _dependencyCancellationToken;
 
         public UnexpectedCancellationInformer(
-            CancellationToken dependencyCancellationToken,
-            ILogger<ResourceInformer<V1Pod>> logger)
+            ILogger<ResourceInformer<V1Pod>> logger,
+            CancellationToken dependencyCancellationToken)
             : base(
                 new Mock<IKubernetes>().Object,
                 new Mock<IHostApplicationLifetime>().Object,

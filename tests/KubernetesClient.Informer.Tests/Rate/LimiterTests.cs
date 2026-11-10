@@ -123,7 +123,7 @@ public class LimiterTests
         timeProvider.VerifyTimer(0, TimeSpan.FromSeconds(1));
         timeProvider.Advance(TimeSpan.FromSeconds(1));
         timeProvider.FireTimer(0);
-        await waiting.WaitAsync(TimeSpan.FromSeconds(5));
+        await waiting.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
     }
 
     [Fact]

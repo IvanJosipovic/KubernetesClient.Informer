@@ -12,10 +12,13 @@ namespace KubernetesClient.Informer.Client;
 public class ResourceSelector<TResource>
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
+    /// <summary>Initializes a selector with a Kubernetes field-selector expression.</summary>
+    /// <param name="fieldSelector">The field-selector expression.</param>
     public ResourceSelector(string fieldSelector)
     {
         FieldSelector = fieldSelector;
     }
 
+    /// <summary>Gets the field-selector expression.</summary>
     public string FieldSelector { get; }
 }

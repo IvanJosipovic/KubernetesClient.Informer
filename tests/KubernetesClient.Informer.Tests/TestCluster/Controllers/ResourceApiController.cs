@@ -23,10 +23,10 @@ public class ResourceApiController : ControllerBase
     }
 
     [FromRoute]
-    public string Version { get; set; }
+    public string Version { get; set; } = string.Empty;
 
     [FromRoute]
-    public string Plural { get; set; }
+    public string Plural { get; set; } = string.Empty;
 
     [HttpGet]
     public async Task<IActionResult> ListAsync(ListParameters parameters)
@@ -50,7 +50,7 @@ public class ResourceApiController : ControllerBase
             Response.ContentType = "application/json";
             foreach (var item in initialList.Items)
             {
-                await Response.WriteAsync(JsonSerializer.Serialize(new WatchEvent { Type = "ADDED", Object = item }));
+                await Response.WriteAsync(JsonSerializer.Serialize(new WatchEvent { Type = "ADDED", Resource = item }));
                 await Response.WriteAsync("\n");
             }
 
@@ -76,7 +76,7 @@ public class ResourceApiController : ControllerBase
                     Annotations = new Dictionary<string, string> { ["k8s.io/initial-events-end"] = "true" },
                 },
             };
-            await Response.WriteAsync(JsonSerializer.Serialize(new WatchEvent { Type = "BOOKMARK", Object = bookmark }));
+            await Response.WriteAsync(JsonSerializer.Serialize(new WatchEvent { Type = "BOOKMARK", Resource = bookmark }));
             await Response.WriteAsync("\n");
             return new EmptyResult();
         }

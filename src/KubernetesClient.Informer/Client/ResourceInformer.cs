@@ -127,6 +127,63 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         CallbackFailed = 111,
     }
 
+    private static readonly Action<ILogger, string, Exception?> WatchingStoppedLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        EventId(EventType.WatchingStopped),
+        "Stopped watching {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, Exception?> WatchingFailedLog = LoggerMessage.Define<string>(
+        LogLevel.Error,
+        EventId(EventType.WatchingFailed),
+        "Failed while watching {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, TimeSpan, Exception?> RetryScheduledWarningLog = LoggerMessage.Define<string, TimeSpan>(
+        LogLevel.Warning,
+        EventId(EventType.WatchingRetryScheduled),
+        "Retrying {ResourceType} in {RetryDelay} after a failure.");
+    private static readonly Action<ILogger, string, TimeSpan, Exception?> RetryScheduledErrorLog = LoggerMessage.Define<string, TimeSpan>(
+        LogLevel.Error,
+        EventId(EventType.WatchingRetryScheduled),
+        "Retrying {ResourceType} in {RetryDelay} after a failure.");
+    private static readonly Action<ILogger, string, TimeSpan, Exception?> ExpiredResourceVersionLog = LoggerMessage.Define<string, TimeSpan>(
+        LogLevel.Information,
+        EventId(EventType.ReceivedError),
+        "Resource version expired for {ResourceType}; retrying with a full relist in {RetryDelay}.");
+    private static readonly Action<ILogger, string, int?, TimeSpan, Exception?> ListWatchFailureWarningLog = LoggerMessage.Define<string, int?, TimeSpan>(
+        LogLevel.Warning,
+        EventId(EventType.ReceivedError),
+        "List/watch for {ResourceType} failed with status code {StatusCode}; retrying in {RetryDelay}.");
+    private static readonly Action<ILogger, string, int?, TimeSpan, Exception?> ListWatchFailureErrorLog = LoggerMessage.Define<string, int?, TimeSpan>(
+        LogLevel.Error,
+        EventId(EventType.ReceivedError),
+        "List/watch for {ResourceType} failed with status code {StatusCode}; retrying in {RetryDelay}.");
+    private static readonly Action<ILogger, string, string?, Exception?> SynchronizeStartedWithSelectorLog = LoggerMessage.Define<string, string?>(
+        LogLevel.Information,
+        EventId(EventType.SynchronizeStarted),
+        "Started synchronizing {ResourceType} resources from API server with field selector '{FieldSelector}'.");
+    private static readonly Action<ILogger, string, Exception?> SynchronizeStartedLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        EventId(EventType.SynchronizeStarted),
+        "Started synchronizing {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, Exception?> SynchronizeCompleteLog = LoggerMessage.Define<string>(
+        LogLevel.Information,
+        EventId(EventType.SynchronizeComplete),
+        "Completed synchronizing {ResourceType} resources from API server.");
+    private static readonly Action<ILogger, string, string?, Exception?> WatchingResourceLog = LoggerMessage.Define<string, string?>(
+        LogLevel.Information,
+        EventId(EventType.WatchingResource),
+        "Watching {ResourceType} starting from resource version {ResourceVersion}.");
+    private static readonly Action<ILogger, string, Exception?> DisposingWatcherLog = LoggerMessage.Define<string>(
+        LogLevel.Debug,
+        EventId(EventType.DisposingToReconnect),
+        "Disposing watcher for {ResourceType} to cause reconnect.");
+    private static readonly Action<ILogger, string, WatchEventType, string?, string?, string?, string?, Exception?> InformerWatchEventLog = LoggerMessage.Define<string, WatchEventType, string?, string?, string?, string?>(
+        LogLevel.Debug,
+        EventId(EventType.InformerWatchEvent),
+        "Informer {ResourceType} received {WatchEventType} notification for {ItemKind}/{ItemName}.{ItemNamespace} at resource version {ResourceVersion}");
+    private static readonly Action<ILogger, string, Exception?> CallbackFailedLog = LoggerMessage.Define<string>(
+        LogLevel.Error,
+        EventId(EventType.CallbackFailed),
+        "ResourceInformerCallback for {ResourceType} failed; removing its registration.");
+    /// <summary>Gets the Kubernetes API client used by this informer.</summary>
     protected IKubernetes Client { get; init; }
 
     /// <inheritdoc/>
@@ -257,10 +314,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 }
 
                 Status = ResourceInformerStatus.Stopped;
-                Logger.LogInformation(
-                    EventId(EventType.WatchingStopped),
-                    "Stopped watching {ResourceType} resources from API server.",
-                    typeof(TResource).Name);
+                WatchingStoppedLog(Logger, typeof(TResource).Name, null);
                 throw;
             }
             catch (Exception error)
@@ -274,11 +328,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 InformerDiagnostics.RecordException(activity, error);
                 if (!isRunInfiniteInvocation || error is OperationCanceledException)
                 {
-                    Logger.LogError(
-                        EventId(EventType.WatchingFailed),
-                        error,
-                        "Failed while watching {ResourceType} resources from API server.",
-                        typeof(TResource).Name);
+                    WatchingFailedLog(Logger, typeof(TResource).Name, error);
                 }
                 throw;
             }
@@ -324,13 +374,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                     Status = ResourceInformerStatus.Retrying;
                     var retryDelay = GetRetryDelay(error, retryAttempt++, _timeProvider);
 
-                    Logger.Log(
-                        GetFailureLogLevel(error, GetStatusCode(error)),
-                        EventId(EventType.WatchingRetryScheduled),
-                        error,
-                        "Retrying {ResourceType} in {RetryDelay} after a failure.",
-                        typeof(TResource).Name,
-                        retryDelay);
+                    var logLevel = GetFailureLogLevel(error, GetStatusCode(error));
+                    var log = logLevel == LogLevel.Warning ? RetryScheduledWarningLog : RetryScheduledErrorLog;
+                    log(Logger, typeof(TResource).Name, retryDelay, error);
 
                     await Task.Delay(retryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
                 }
@@ -350,11 +396,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             Status = ResourceInformerStatus.Faulted;
             if (!IsRetryable(error))
             {
-                Logger.LogError(
-                    EventId(EventType.WatchingFailed),
-                    error,
-                    "Failed while watching {ResourceType} resources from API server.",
-                    typeof(TResource).Name);
+                WatchingFailedLog(Logger, typeof(TResource).Name, error);
             }
 
             throw;
@@ -614,28 +656,16 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     {
         InformerDiagnostics.RecordException(Activity.Current, error);
 
-        var eventId = EventId(EventType.ReceivedError);
         if (IsExpiredResourceVersion(error))
         {
-            Logger.LogInformation(
-                eventId,
-                error,
-                "Resource version expired for {ResourceType}; retrying with a full relist in {RetryDelay}.",
-                typeof(TResource).Name,
-                retryDelay);
+            ExpiredResourceVersionLog(Logger, typeof(TResource).Name, retryDelay, error);
             return;
         }
 
         var statusCode = GetStatusCode(error);
         var level = GetFailureLogLevel(error, statusCode);
-        Logger.Log(
-            level,
-            eventId,
-            error,
-            "List/watch for {ResourceType} failed with status code {StatusCode}; retrying in {RetryDelay}.",
-            typeof(TResource).Name,
-            statusCode,
-            retryDelay);
+        var log = level == LogLevel.Warning ? ListWatchFailureWarningLog : ListWatchFailureErrorLog;
+        log(Logger, typeof(TResource).Name, statusCode, retryDelay, error);
     }
 
     private static LogLevel GetFailureLogLevel(Exception error, int? statusCode)
@@ -917,18 +947,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         if (_selector?.FieldSelector is not null)
         {
-            Logger.LogInformation(
-                EventId(EventType.SynchronizeStarted),
-                "Started synchronizing {ResourceType} resources from API server with field selector '{FieldSelector}'.",
-                typeof(TResource).Name,
-                _selector.FieldSelector);
+            SynchronizeStartedWithSelectorLog(Logger, typeof(TResource).Name, _selector.FieldSelector, null);
         }
         else
         {
-            Logger.LogInformation(
-                EventId(EventType.SynchronizeStarted),
-                "Started synchronizing {ResourceType} resources from API server.",
-                typeof(TResource).Name);
+            SynchronizeStartedLog(Logger, typeof(TResource).Name, null);
         }
 
         string? continueParameter = null;
@@ -964,10 +987,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         await CommitInitialCacheAsync(nextCache, listedItems, nextResourceVersion, activity).ConfigureAwait(false);
 
-        Logger.LogInformation(
-            EventId(EventType.SynchronizeComplete),
-            "Completed synchronizing {ResourceType} resources from API server.",
-            typeof(TResource).Name);
+        SynchronizeCompleteLog(Logger, typeof(TResource).Name, null);
         activity?.SetStatus(ActivityStatusCode.Ok);
         activity?.SetTag("k8s.informer.resource_count", nextCache.Count);
     }
@@ -1051,7 +1071,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         SetResourceTags(activity);
         activity?.SetTag("k8s.informer.resource_version", _lastResourceVersion);
 
-        Logger.LogInformation(EventId(EventType.WatchingResource), "Watching {ResourceType} starting from resource version {ResourceVersion}.", typeof(TResource).Name, _lastResourceVersion);
+        WatchingResourceLog(Logger, typeof(TResource).Name, _lastResourceVersion, null);
 
         var lastEventUtc = _timeProvider.GetUtcNow();
         using var reconnectCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -1061,7 +1081,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             if (lastEvent > TimeSpan.FromMinutes(9.5))
             {
                 lastEventUtc = DateTimeOffset.MaxValue;
-                Logger.LogDebug(EventId(EventType.DisposingToReconnect), "Disposing watcher for {ResourceType} to cause reconnect.", typeof(TResource).Name);
+                DisposingWatcherLog(Logger, typeof(TResource).Name, null);
                 reconnectCancellationTokenSource.Cancel();
             }
         }, state: null, dueTime: TimeSpan.FromSeconds(45), period: TimeSpan.FromSeconds(45));
@@ -1101,15 +1121,15 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         activity?.SetTag("k8s.resource.namespace", item.Namespace());
         activity?.SetTag("k8s.resource.version", item.ResourceVersion());
 
-        Logger.LogDebug(
-            EventId(EventType.InformerWatchEvent),
-            "Informer {ResourceType} received {WatchEventType} notification for {ItemKind}/{ItemName}.{ItemNamespace} at resource version {ResourceVersion}",
+        InformerWatchEventLog(
+            Logger,
             typeof(TResource).Name,
             watchEventType,
             item.Kind,
             item.Name(),
             item.Namespace(),
-            item.ResourceVersion());
+            item.ResourceVersion(),
+            null);
 
         ImmutableList<Registration> registrations;
         lock (_sync)
@@ -1169,9 +1189,5 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     }
 
     private void ReportCallbackFailure(Exception error)
-        => Logger.LogError(
-            EventId(EventType.CallbackFailed),
-            error,
-            "ResourceInformerCallback for {ResourceType} failed; removing its registration.",
-            typeof(TResource).Name);
+        => CallbackFailedLog(Logger, typeof(TResource).Name, error);
 }

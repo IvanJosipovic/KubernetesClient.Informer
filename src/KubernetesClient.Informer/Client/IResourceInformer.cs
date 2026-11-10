@@ -59,6 +59,7 @@ public interface IResourceInformer<TResource> : IHostedService, IResourceInforme
     Task RunInfinite(CancellationToken cancellationToken);
 }
 
+/// <summary>Provides lifecycle and registration operations for a resource informer.</summary>
 public interface IResourceInformer
 {
     /// <summary>
