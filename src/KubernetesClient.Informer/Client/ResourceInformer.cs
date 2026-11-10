@@ -29,6 +29,8 @@ namespace KubernetesClient.Informer.Client;
 public partial class ResourceInformer<TResource> : BackgroundHostedService, INotifyPropertyChanged, IResourceInformer<TResource>
     where TResource : class, IKubernetesObject<V1ObjectMeta>, new()
 {
+    private static readonly TimeSpan HealthyWatchDuration = TimeSpan.FromMinutes(1);
+
     private readonly object _sync = new();
     private readonly GroupApiVersionKind _groupApiVersionKind;
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -117,6 +119,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         IgnoringError = 108,
         WatchingFailed = 109,
         WatchingRetryScheduled = 110,
+        CallbackFailed = 111,
     }
 
     protected IKubernetes Client { get; init; }
@@ -264,11 +267,14 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
                 Status = ResourceInformerStatus.Faulted;
                 InformerDiagnostics.RecordException(activity, error);
-                Logger.LogError(
-                    EventId(EventType.WatchingFailed),
-                    error,
-                    "Failed while watching {ResourceType} resources from API server.",
-                    typeof(TResource).Name);
+                if (!isRunInfiniteInvocation || error is OperationCanceledException)
+                {
+                    Logger.LogError(
+                        EventId(EventType.WatchingFailed),
+                        error,
+                        "Failed while watching {ResourceType} resources from API server.",
+                        typeof(TResource).Name);
+                }
                 throw;
             }
         }
@@ -311,8 +317,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                     Status = ResourceInformerStatus.Retrying;
                     var retryDelay = GetRetryDelay(error, retryAttempt++, _timeProvider);
 
-                    Logger.LogWarning(
+                    Logger.Log(
+                        GetFailureLogLevel(error, GetStatusCode(error)),
                         EventId(EventType.WatchingRetryScheduled),
+                        error,
                         "Retrying {ResourceType} in {RetryDelay} after a failure.",
                         typeof(TResource).Name,
                         retryDelay);
@@ -369,34 +377,44 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 }
 
                 Status = ResourceInformerStatus.Running;
-                await WatchAsync(cancellationToken).ConfigureAwait(true);
+                var watchStartedAt = _timeProvider.GetTimestamp();
+                try
+                {
+                    await WatchAsync(cancellationToken).ConfigureAwait(true);
+                }
+                catch
+                {
+                    if (_timeProvider.GetElapsedTime(watchStartedAt) >= HealthyWatchDuration)
+                    {
+                        retryAttempt = 0;
+                    }
+
+                    throw;
+                }
+
                 Status = ResourceInformerStatus.Retrying;
                 retryAttempt = 0;
             }
             catch (IOException ex) when (ex.InnerException is SocketException)
             {
-                LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
             }
             catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
             {
-                LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
             }
             catch (HttpRequestException ex)
             {
-                LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
             }
             catch (HttpOperationException ex)
             {
-                LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
 
                 if (IsExpiredResourceVersion(ex))
@@ -409,7 +427,6 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             }
             catch (KubernetesException ex)
             {
-                LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
 
                 // Resource version expiry requires a full re-sync so no updates are missed.
@@ -423,7 +440,6 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             }
             catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
-                LogWatchError(ex);
                 Status = ResourceInformerStatus.Retrying;
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
@@ -436,15 +452,67 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private static EventId EventId(EventType eventType) => new EventId((int)eventType, eventType.ToString());
 
-    private void LogWatchError(Exception error)
+    private void LogListWatchFailure(Exception error, TimeSpan retryDelay)
     {
         InformerDiagnostics.RecordException(Activity.Current, error);
-        Logger.LogDebug(
-            EventId(EventType.ReceivedError),
-            "Received error during list/watch for {ResourceType}: {ErrorMessage}",
+
+        var eventId = EventId(EventType.ReceivedError);
+        if (IsExpiredResourceVersion(error))
+        {
+            Logger.LogInformation(
+                eventId,
+                error,
+                "Resource version expired for {ResourceType}; retrying with a full relist in {RetryDelay}.",
+                typeof(TResource).Name,
+                retryDelay);
+            return;
+        }
+
+        var statusCode = GetStatusCode(error);
+        var level = GetFailureLogLevel(error, statusCode);
+        Logger.Log(
+            level,
+            eventId,
+            error,
+            "List/watch for {ResourceType} failed with status code {StatusCode}; retrying in {RetryDelay}.",
             typeof(TResource).Name,
-            error);
+            statusCode,
+            retryDelay);
     }
+
+    private static LogLevel GetFailureLogLevel(Exception error, int? statusCode)
+    {
+        if (statusCode is (int)HttpStatusCode.RequestTimeout or (int)HttpStatusCode.TooManyRequests
+            || statusCode >= 500)
+        {
+            return LogLevel.Warning;
+        }
+
+        if (statusCode is >= 400 and < 500)
+        {
+            return LogLevel.Error;
+        }
+
+        return error is IOException or HttpRequestException or OperationCanceledException
+            ? LogLevel.Warning
+            : LogLevel.Error;
+    }
+
+    private static int? GetStatusCode(Exception error)
+        => error switch
+        {
+            HttpOperationException httpException => (int?)httpException.Response?.StatusCode,
+            KubernetesException kubernetesException => kubernetesException.Status?.Code,
+            _ => null,
+        };
+
+    private static bool IsExpiredResourceVersion(Exception exception)
+        => exception switch
+        {
+            HttpOperationException httpException => IsExpiredResourceVersion(httpException),
+            KubernetesException kubernetesException => IsExpiredResourceVersion(kubernetesException),
+            _ => false,
+        };
 
     private static bool IsExpiredResourceVersion(KubernetesException exception)
         => exception.Status?.Code == (int)HttpStatusCode.Gone
@@ -526,8 +594,13 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         return null;
     }
 
-    private Task WaitBeforeRetryAsync(Exception exception, int attempt, CancellationToken cancellationToken)
-        => Task.Delay(GetRetryDelay(exception, attempt, _timeProvider), _timeProvider, cancellationToken);
+    private async Task WaitBeforeRetryAsync(Exception exception, int attempt, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var retryDelay = GetRetryDelay(exception, attempt, _timeProvider);
+        LogListWatchFailure(exception, retryDelay);
+        await Task.Delay(retryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
+    }
 
     private Task<HttpOperationResponse<TResponse>> CreateResponseAsync<TResponse>(bool? watch, int? limit, bool? allowWatchBookmarks, string? continueParameter, string? resourceVersion, CancellationToken cancellationToken)
         where TResponse : class
@@ -738,12 +811,6 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             await foreach (var (eventType, resource) in watchWithHttpMessage.WatchAsync<TResource, TResource>((e) =>
 #pragma warning restore CS0618 // Type or member is obsolete
             {
-                Logger.LogError(
-                    EventId(EventType.ReceivedError),
-                    e,
-                    "Received error while watching {ResourceType} resources from API server.",
-                    typeof(TResource).Name);
-
                 ExceptionDispatchInfo.Capture(e).Throw();
             }, reconnectCancellationTokenSource.Token))
             {
@@ -834,7 +901,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private void ReportCallbackFailure(Exception error)
         => Logger.LogError(
-            EventId(EventType.WatchingFailed),
+            EventId(EventType.CallbackFailed),
             error,
             "ResourceInformerCallback for {ResourceType} failed; removing its registration.",
             typeof(TResource).Name);

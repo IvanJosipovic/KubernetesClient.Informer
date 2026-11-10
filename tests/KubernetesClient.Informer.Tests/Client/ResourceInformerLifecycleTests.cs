@@ -205,7 +205,8 @@ public class ResourceInformerLifecycleTests
     {
         using var cancellation = new CancellationTokenSource();
         var timeProvider = new TestTimeProvider();
-        using var informer = new RetryOnceInformer(timeProvider);
+        var logger = new RecordingLogger();
+        using var informer = new RetryOnceInformer(timeProvider, logger);
 
         var runTask = informer.RunInfinite(cancellation.Token);
         await timeProvider.WaitForTimerCountAsync(1, cancellation.Token).DefaultTimeout();
@@ -220,6 +221,10 @@ public class ResourceInformerLifecycleTests
 
         Assert.Equal(2, informer.RunCount);
         Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
+        var retryLog = Assert.Single(logger.Entries, entry => entry.EventId.Id == 110);
+        Assert.Equal(LogLevel.Error, retryLog.LogLevel);
+        Assert.IsType<InvalidOperationException>(retryLog.Exception);
+        Assert.DoesNotContain(logger.Entries, entry => entry.EventId.Id == 109 && entry.LogLevel == LogLevel.Error);
     }
 
     [Fact]
@@ -304,11 +309,11 @@ public class ResourceInformerLifecycleTests
     {
         private int _runCount;
 
-        public RetryOnceInformer(TimeProvider timeProvider)
+        public RetryOnceInformer(TimeProvider timeProvider, ILogger<ResourceInformer<V1Pod>> logger)
             : base(
                 new Mock<IKubernetes>().Object,
                 new Mock<IHostApplicationLifetime>().Object,
-                NullLogger<ResourceInformer<V1Pod>>.Instance,
+                logger,
                 timeProvider: timeProvider)
         {
         }
@@ -376,7 +381,21 @@ public class ResourceInformerLifecycleTests
 
     private sealed class RecordingLogger : ILogger<ResourceInformer<V1Pod>>
     {
+        private readonly object _sync = new();
+        private readonly List<RecordedLog> _entries = [];
+
         public bool RetryWasLogged { get; private set; }
+
+        public IReadOnlyList<RecordedLog> Entries
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _entries.ToArray();
+                }
+            }
+        }
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull
             => NullLogger.Instance.BeginScope(state);
@@ -390,10 +409,17 @@ public class ResourceInformerLifecycleTests
             Exception? exception,
             Func<TState, Exception?, string> formatter)
         {
-            if (formatter(state, exception).StartsWith("Retrying ", StringComparison.Ordinal))
+            var message = formatter(state, exception);
+            lock (_sync)
             {
-                RetryWasLogged = true;
+                _entries.Add(new RecordedLog(logLevel, eventId, exception, message));
+                if (message.StartsWith("Retrying ", StringComparison.Ordinal))
+                {
+                    RetryWasLogged = true;
+                }
             }
         }
     }
+
+    private sealed record RecordedLog(LogLevel LogLevel, EventId EventId, Exception? Exception, string Message);
 }

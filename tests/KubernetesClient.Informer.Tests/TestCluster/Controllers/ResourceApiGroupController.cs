@@ -2,7 +2,10 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using k8s.Models;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using KubernetesClient.Informer.Tests.TestCluster.Models;
 
@@ -30,6 +33,25 @@ public class ResourceApiGroupController : ControllerBase
     [HttpGet]
     public async Task<IActionResult> ListAsync(ListParameters parameters)
     {
+        if (parameters.Watch == true)
+        {
+            await _testCluster.ListResourcesAsync(Group, Version, Plural, parameters);
+            if (_testCluster.WatchResponseGate is { } watchResponseGate)
+            {
+                await watchResponseGate.WaitAsync(HttpContext.RequestAborted);
+            }
+
+            Response.ContentType = "application/json";
+            foreach (var watchEvent in _testCluster.WatchEvents.ToArray())
+            {
+                await Response.WriteAsync(JsonSerializer.Serialize(watchEvent));
+                await Response.WriteAsync("\n");
+                _testCluster.WatchEvents.Remove(watchEvent);
+            }
+
+            return new EmptyResult();
+        }
+
         var list = await _testCluster.ListResourcesAsync(Group, Version, Plural, parameters);
 
         var result = new KubernetesList<ResourceObject>(list.Items, Version, V1DeploymentList.KubeKind, new V1ListMeta()
