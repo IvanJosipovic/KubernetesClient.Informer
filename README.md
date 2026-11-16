@@ -23,7 +23,7 @@ Use it to keep application state synchronized with resources such as Pods, Deplo
 dotnet add package KubernetesClient.Informer
 ```
 
-The library targets .NET 10 and .NET 11 RC3. `AddKubernetesCore()` uses the default Kubernetes client configuration, which reads the local kubeconfig when available or in-cluster configuration when running in Kubernetes. You can also register your own `IKubernetes` client before calling `AddKubernetesCore()`, including a client without credentials for an unauthenticated API server.
+The library targets .NET 10 and .NET 11. `AddKubernetesCore()` uses the default Kubernetes client configuration, which reads the local kubeconfig when available or in-cluster configuration when running in Kubernetes. You can also register your own `IKubernetes` client before calling `AddKubernetesCore()`, including a client without credentials for an unauthenticated API server.
 
 ## Quick start
 
