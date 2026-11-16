@@ -500,6 +500,58 @@ public class ResourceInformerTests
     }
 
     [Fact]
+    public async Task WatchListInitializesWithUnauthenticatedClient()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "streamed" } })
+            .Build();
+        clusterHost.Cluster.WatchListSupported = true;
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var client = new k8s.Kubernetes(new KubernetesClientConfiguration
+        {
+            Host = clusterHost.Client.BaseUri.ToString(),
+        });
+        Assert.Null(client.Credentials);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new ConcurrentQueue<string>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+        {
+            if (eventType == WatchEventType.Added)
+            {
+                received.Enqueue(pod.Name());
+            }
+        }));
+
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        try
+        {
+            await clusterHost.Cluster.WaitForWatchListRequestAsync(1).WaitAsync(cancellation.Token);
+            await registration.ReadyAsync(cancellation.Token);
+            Assert.Equal(["streamed"], received.ToArray());
+            Assert.Empty(clusterHost.Cluster.ListRequests);
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try
+            {
+                await runTask;
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+            }
+        }
+    }
+
+    [Fact]
     public async Task WatchListInitializesCacheWithoutAnInitialListRequest()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
