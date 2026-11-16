@@ -895,7 +895,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         try
         {
-            await kubernetes.Credentials.ProcessHttpRequestAsync(request, cancellationToken).ConfigureAwait(false);
+            if (kubernetes.Credentials is { } credentials)
+            {
+                await credentials.ProcessHttpRequestAsync(request, cancellationToken).ConfigureAwait(false);
+            }
             response = await kubernetes.HttpClient.SendAsync(
                 request,
                 HttpCompletionOption.ResponseHeadersRead,
