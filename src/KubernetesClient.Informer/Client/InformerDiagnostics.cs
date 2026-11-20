@@ -24,14 +24,15 @@ public static class InformerDiagnostics
             return;
         }
 
-        activity.SetStatus(ActivityStatusCode.Error, exception.Message);
+        // Only the exception type is exported. Messages and stack traces can contain raw
+        // Kubernetes API response bodies (status objects, admission messages, etc.), which
+        // may carry sensitive resource data into distributed traces.
+        activity.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
         activity.AddEvent(new ActivityEvent(
             "exception",
             tags: new ActivityTagsCollection
             {
-                ["exception.type"] = exception.GetType().FullName,
-                ["exception.message"] = exception.Message,
-                ["exception.stacktrace"] = exception.ToString()
+                ["exception.type"] = exception.GetType().FullName
             }));
     }
 }

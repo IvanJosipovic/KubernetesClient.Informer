@@ -21,6 +21,12 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
         private readonly TaskCompletionSource _initialDelivery = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly bool _waitForInformerSync;
         private int _disposedValue;
+        private int _queuedCount;
+
+        // A consumer that cannot keep up must not be allowed to grow the queue without bound.
+        // When the backlog reaches this limit the registration is removed, just like a callback
+        // that throws, so the informer and other registrations keep running.
+        internal const int MaxQueuedNotifications = 10_000;
 
         private readonly record struct Notification(WatchEventType? EventType, TResource? Resource, bool IsReadyMarker);
 
@@ -47,7 +53,25 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
         }
 
         internal void Enqueue(WatchEventType eventType, TResource resource)
-            => _notifications.Writer.TryWrite(new Notification(eventType, resource, IsReadyMarker: false));
+        {
+            if (Volatile.Read(ref _disposedValue) != 0)
+            {
+                return;
+            }
+
+            if (Interlocked.Increment(ref _queuedCount) > MaxQueuedNotifications)
+            {
+                Interlocked.Decrement(ref _queuedCount);
+                ResourceInformer.ReportRegistrationBacklog();
+                Dispose();
+                return;
+            }
+
+            if (!_notifications.Writer.TryWrite(new Notification(eventType, resource, IsReadyMarker: false)))
+            {
+                Interlocked.Decrement(ref _queuedCount);
+            }
+        }
 
         internal void EnqueueReady()
             => _notifications.Writer.TryWrite(new Notification(EventType: null, Resource: null, IsReadyMarker: true));
@@ -88,6 +112,10 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
                         }
 
                         return;
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _queuedCount);
                     }
                 }
             }

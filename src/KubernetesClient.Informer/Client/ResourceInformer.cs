@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using k8s;
 using k8s.Autorest;
 using k8s.Models;
@@ -34,6 +35,8 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private static readonly TimeSpan HealthyWatchDuration = TimeSpan.FromMinutes(1);
     private const int WatchListBootstrapTimeoutSeconds = 30;
     private const string InitialEventsEndAnnotation = "k8s.io/initial-events-end";
+    private const int MaxConsecutiveUnexpectedRunFailures = 3;
+    private static readonly long IdleWatchReconnectTicks = TimeSpan.FromMinutes(9.5).Ticks;
 
     private readonly object _sync = new();
     private readonly GroupApiVersionKind _groupApiVersionKind;
@@ -124,6 +127,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         WatchingFailed = 109,
         WatchingRetryScheduled = 110,
         CallbackFailed = 111,
+        RegistrationBacklog = 112,
     }
 
     private static readonly Action<ILogger, string, Exception?> WatchingStoppedLog = LoggerMessage.Define<string>(
@@ -182,6 +186,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         LogLevel.Error,
         EventId(EventType.CallbackFailed),
         "ResourceInformerCallback for {ResourceType} failed; removing its registration.");
+    private static readonly Action<ILogger, string, int, Exception?> RegistrationBacklogLog = LoggerMessage.Define<string, int>(
+        LogLevel.Error,
+        EventId(EventType.RegistrationBacklog),
+        "Registration for {ResourceType} exceeded the queued-notification limit of {Limit}; removing the registration.");
     /// <summary>Gets the Kubernetes API client used by this informer.</summary>
     protected IKubernetes Client { get; init; }
 
@@ -342,6 +350,15 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     /// <inheritdoc/>
     public async Task RunInfinite(CancellationToken cancellationToken)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // Link the caller's token with the hosted-service run token so Disposing the informer
+        // also stops a manually driven RunInfinite loop instead of leaving an orphan watch.
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            RunCancellationToken);
+        var runToken = linkedCancellation.Token;
+
         lock (_sync)
         {
             if (_runActive != 0 || _runInfiniteActive != 0)
@@ -356,25 +373,41 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         {
             StartWatching();
             var retryAttempt = 0;
+            var unexpectedFailures = 0;
 
-            while (!cancellationToken.IsCancellationRequested)
+            while (!runToken.IsCancellationRequested)
             {
                 try
                 {
                     _runInfiniteInvocation.Value = true;
                     try
                     {
-                        await RunAsync(cancellationToken).ConfigureAwait(false);
+                        await RunAsync(runToken).ConfigureAwait(false);
                     }
                     finally
                     {
                         _runInfiniteInvocation.Value = false;
                     }
+
+                    retryAttempt = 0;
+                    unexpectedFailures = 0;
                 }
-                catch (Exception error) when (!cancellationToken.IsCancellationRequested
+                catch (Exception error) when (!runToken.IsCancellationRequested
                     && error is not OperationCanceledException
                     && IsRetryable(error))
                 {
+                    // Unexpected (non-transient) exceptions are retried for resilience, but a
+                    // persistently failing consumer must eventually fault instead of retrying
+                    // forever with no Faulted transition.
+                    if (IsTransientForRetry(error))
+                    {
+                        unexpectedFailures = 0;
+                    }
+                    else if (++unexpectedFailures >= MaxConsecutiveUnexpectedRunFailures)
+                    {
+                        throw;
+                    }
+
                     Status = ResourceInformerStatus.Retrying;
                     var retryDelay = GetRetryDelay(error, retryAttempt++, _timeProvider);
 
@@ -382,16 +415,16 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                     var log = logLevel == LogLevel.Warning ? RetryScheduledWarningLog : RetryScheduledErrorLog;
                     log(Logger, typeof(TResource).Name, retryDelay, error);
 
-                    await Task.Delay(retryDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(retryDelay, _timeProvider, runToken).ConfigureAwait(false);
                 }
             }
 
-            _ready.TrySetCanceled(cancellationToken);
+            _ready.TrySetCanceled(runToken);
             Status = ResourceInformerStatus.Stopped;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (runToken.IsCancellationRequested)
         {
-            _ready.TrySetCanceled(cancellationToken);
+            _ready.TrySetCanceled(runToken);
             Status = ResourceInformerStatus.Stopped;
         }
         catch (Exception error)
@@ -485,6 +518,15 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             }
             catch (HttpRequestException ex)
             {
+                // Transport-level failures have no status code and are transient. A status code
+                // that the server marks as non-retryable (401, 403, 404, ...) must fault instead
+                // of being retried forever — otherwise a WatchList RBAC failure never reaches the
+                // list fallback and ReadyAsync never completes.
+                if (!IsRetryable(ex))
+                {
+                    throw;
+                }
+
                 Status = ResourceInformerStatus.Retrying;
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
@@ -524,7 +566,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
                 continue;
             }
-            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested && IsTransientForRetry(ex))
             {
                 Status = ResourceInformerStatus.Retrying;
                 await WaitBeforeRetryAsync(ex, retryAttempt++, cancellationToken).ConfigureAwait(false);
@@ -538,15 +580,20 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private static EventId EventId(EventType eventType) => new EventId((int)eventType, eventType.ToString());
 
+    // The WatchList bootstrap is a short, one-shot operation. A long user-configured watch
+    // timeout must not be inherited here, otherwise a stuck bootstrap delays the list fallback
+    // for minutes. Short values are still honored.
+    private int GetWatchListBootstrapTimeoutSeconds()
+        => _timeoutSeconds is > 0
+            ? Math.Min(_timeoutSeconds.Value, WatchListBootstrapTimeoutSeconds)
+            : WatchListBootstrapTimeoutSeconds;
+
     private async Task<bool> TryWatchListAsync(Action initialSyncCompleted, CancellationToken cancellationToken)
     {
         using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(TryWatchListAsync), ActivityKind.Client);
         SetResourceTags(activity);
         using var bootstrapTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var bootstrapTimeoutSeconds = _timeoutSeconds is > 0
-            ? _timeoutSeconds.Value
-            : WatchListBootstrapTimeoutSeconds;
-        bootstrapTimeout.CancelAfter(TimeSpan.FromSeconds(bootstrapTimeoutSeconds));
+        bootstrapTimeout.CancelAfter(TimeSpan.FromSeconds(GetWatchListBootstrapTimeoutSeconds()));
 
         try
         {
@@ -644,15 +691,51 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
-            var genericEvent = KubernetesJson.Deserialize<Watcher<KubernetesObject>.WatchEvent>(line);
-            if (genericEvent.Object?.Kind == "Status")
+            // A watch stream can contain blank lines or malformed frames (for example when a
+            // proxy injects data). Skip them instead of letting a null dereference turn into an
+            // endless retry loop in the caller.
+            if (string.IsNullOrWhiteSpace(line))
             {
-                var statusEvent = KubernetesJson.Deserialize<Watcher<V1Status>.WatchEvent>(line);
-                throw new KubernetesException(statusEvent.Object);
+                continue;
             }
 
-            var watchEvent = KubernetesJson.Deserialize<Watcher<TResource>.WatchEvent>(line);
-            yield return (watchEvent.Type, watchEvent.Object);
+            Watcher<KubernetesObject>.WatchEvent? genericEvent;
+            try
+            {
+                genericEvent = KubernetesJson.Deserialize<Watcher<KubernetesObject>.WatchEvent>(line);
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+
+            if (genericEvent?.Object?.Kind == "Status")
+            {
+                var statusEvent = KubernetesJson.Deserialize<Watcher<V1Status>.WatchEvent>(line);
+                if (statusEvent?.Object is { } status)
+                {
+                    throw new KubernetesException(status);
+                }
+
+                continue;
+            }
+
+            Watcher<TResource>.WatchEvent? watchEvent;
+            try
+            {
+                watchEvent = KubernetesJson.Deserialize<Watcher<TResource>.WatchEvent>(line);
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+
+            if (watchEvent?.Object is not { } resource)
+            {
+                continue;
+            }
+
+            yield return (watchEvent.Type, resource);
         }
     }
 
@@ -720,17 +803,30 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private static bool IsRetryable(KubernetesException exception)
         => IsExpiredResourceVersion(exception) || IsRetryableStatusCode(exception.Status?.Code);
 
+    private static bool IsRetryable(HttpRequestException exception)
+        // No status code means a transport-level failure, which is transient. A status code is
+        // only retried when the API server explicitly marks it as retryable.
+        => exception.StatusCode is not { } statusCode || IsRetryableStatusCode((int)statusCode);
+
     private static bool IsRetryable(Exception exception)
         => exception switch
         {
             HttpOperationException httpException => IsRetryable(httpException),
             KubernetesException kubernetesException => IsRetryable(kubernetesException),
+            HttpRequestException httpException => IsRetryable(httpException),
             _ => true,
         };
 
     private static bool IsRetryableStatusCode(int? statusCode)
         => statusCode is (int)HttpStatusCode.Gone or (int)HttpStatusCode.TooManyRequests
             || statusCode >= 500;
+
+    // Only these failures are treated as transient by the list/watch loop. Everything else
+    // (null references, argument errors, invalid operations, ...) is a defect or a permanent
+    // configuration problem and must fault the run instead of being retried indefinitely.
+    private static bool IsTransientForRetry(Exception error)
+        => error is IOException or SocketException or HttpRequestException or HttpOperationException
+            or KubernetesException or OperationCanceledException or ObjectDisposedException or TimeoutException;
 
     private string? GetListResourceVersion()
     {
@@ -883,7 +979,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             "sendInitialEvents=true",
             "allowWatchBookmarks=true",
             "resourceVersionMatch=NotOlderThan",
-            $"timeoutSeconds={(_timeoutSeconds is > 0 ? _timeoutSeconds.Value : WatchListBootstrapTimeoutSeconds)}",
+            $"timeoutSeconds={GetWatchListBootstrapTimeoutSeconds()}",
         };
 
         if (_selector?.FieldSelector is { } fieldSelector)
@@ -908,7 +1004,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             {
                 await credentials.ProcessHttpRequestAsync(request, cancellationToken).ConfigureAwait(false);
             }
-            response = await kubernetes.HttpClient.SendAsync(
+
+            var httpClient = kubernetes.HttpClient
+                ?? throw new ObjectDisposedException(nameof(IKubernetes), "The Kubernetes client has been disposed; direct watch requests are unavailable.");
+            response = await httpClient.SendAsync(
                 request,
                 HttpCompletionOption.ResponseHeadersRead,
                 cancellationToken).ConfigureAwait(false);
@@ -922,8 +1021,10 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                     throw new WatchListUnsupportedException();
                 }
 
+                // The response body is deliberately excluded: it can contain raw resource data
+                // and would be copied into logs and telemetry by the failure classifier.
                 throw new HttpRequestException(
-                    $"WatchList request failed with status {(int)response.StatusCode} ({response.StatusCode}): {responseBody}",
+                    $"WatchList request failed with status {(int)response.StatusCode} ({response.StatusCode}).",
                     inner: null,
                     response.StatusCode);
             }
@@ -1005,17 +1106,31 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             await credentials.ProcessHttpRequestAsync(request, cancellationToken).ConfigureAwait(false);
         }
 
-        if (kubernetes.HttpClient is null)
+        // Kubernetes.Dispose() clears HttpClient. Capture it once so disposal between the
+        // check and the send cannot produce a NullReferenceException.
+        var httpClient = kubernetes.HttpClient;
+        if (httpClient is null)
         {
-            // Kubernetes.Dispose() clears HttpClient. Report disposal honestly; the host is
-            // responsible for stopping informers before disposing their client.
             throw new ObjectDisposedException(nameof(IKubernetes), "The Kubernetes client has been disposed; direct watch requests are unavailable.");
         }
 
-        return await kubernetes.HttpClient.SendAsync(
-            request,
-            HttpCompletionOption.ResponseHeadersRead,
-            cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (cancellationToken.IsCancellationRequested
+            && exception is ObjectDisposedException or HttpRequestException)
+        {
+            // A host that disposes the client during shutdown can make the send fail with a
+            // disposal error. Report cancellation so the informer stops cleanly.
+            throw new OperationCanceledException(
+                "The Kubernetes client was disposed while the watch was shutting down.",
+                exception,
+                cancellationToken);
+        }
     }
 
     private sealed class WatchListUnsupportedException : Exception
@@ -1161,44 +1276,70 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         WatchingResourceLog(Logger, typeof(TResource).Name, _lastResourceVersion, null);
 
-        var lastEventUtc = _timeProvider.GetUtcNow();
+        // The idle timestamp is read by the timer callback and written by the event loop.
+        // Use interlocked access on tick counts (stored in an array so ref access is safe in a
+        // captured local) instead of a shared DateTimeOffset, whose struct write can tear.
+        var lastEventTicks = new long[1];
+        lastEventTicks[0] = _timeProvider.GetUtcNow().UtcTicks;
         using var reconnectCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         using var checkLastEventUtcTimer = _timeProvider.CreateTimer(_ =>
         {
-            var lastEvent = _timeProvider.GetUtcNow() - lastEventUtc;
-            if (lastEvent > TimeSpan.FromMinutes(9.5))
+            var elapsedTicks = _timeProvider.GetUtcNow().UtcTicks - Volatile.Read(ref lastEventTicks[0]);
+            if (elapsedTicks > IdleWatchReconnectTicks)
             {
-                lastEventUtc = DateTimeOffset.MaxValue;
+                Interlocked.Exchange(ref lastEventTicks[0], long.MaxValue);
                 DisposingWatcherLog(Logger, typeof(TResource).Name, null);
                 reconnectCancellationTokenSource.Cancel();
             }
         }, state: null, dueTime: TimeSpan.FromSeconds(45), period: TimeSpan.FromSeconds(45));
 
+        async Task ConsumeEventsAsync(HttpContent content, CancellationToken watchToken)
+        {
+            await foreach (var (eventType, resource) in ReadWatchEventsAsync(content, watchToken).ConfigureAwait(true))
+            {
+                Interlocked.Exchange(ref lastEventTicks[0], _timeProvider.GetUtcNow().UtcTicks);
+                OnEvent(eventType, resource);
+            }
+        }
+
         try
         {
-            // Read the response ourselves so the token is observed by the awaited read.
-            using var response = await CreateWatchResponseAsync(reconnectCancellationTokenSource.Token).ConfigureAwait(true);
-            if (!response.IsSuccessStatusCode)
+            if (Client is Kubernetes)
             {
-                var body = await response.Content.ReadAsStringAsync(reconnectCancellationTokenSource.Token).ConfigureAwait(false);
-                throw new HttpOperationException($"Watch request failed with status {(int)response.StatusCode} ({response.StatusCode})")
+                // Read the response ourselves so the token is observed by the awaited read.
+                using var response = await CreateWatchResponseAsync(reconnectCancellationTokenSource.Token).ConfigureAwait(true);
+                if (!response.IsSuccessStatusCode)
                 {
-                    Response = new HttpResponseMessageWrapper(response, body),
-                };
-            }
+                    var body = await response.Content.ReadAsStringAsync(reconnectCancellationTokenSource.Token).ConfigureAwait(false);
+                    throw new HttpOperationException($"Watch request failed with status {(int)response.StatusCode} ({response.StatusCode})")
+                    {
+                        Response = new HttpResponseMessageWrapper(response, body),
+                    };
+                }
 
-            await foreach (var (eventType, resource) in ReadWatchEventsAsync(
-                response.Content,
-                reconnectCancellationTokenSource.Token).ConfigureAwait(true))
+                await ConsumeEventsAsync(response.Content, reconnectCancellationTokenSource.Token).ConfigureAwait(true);
+            }
+            else
             {
-                lastEventUtc = _timeProvider.GetUtcNow();
-                OnEvent(eventType, resource);
+                // Portable fallback for custom IKubernetes implementations: the generated
+                // client returns a streaming watch response consumed by the same reader.
+                using var envelope = await CreatePortableWatchResponseAsync(reconnectCancellationTokenSource.Token).ConfigureAwait(true);
+                await ConsumeEventsAsync(envelope.Response.Content, reconnectCancellationTokenSource.Token).ConfigureAwait(true);
             }
         }
         catch (OperationCanceledException) when (reconnectCancellationTokenSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
         }
     }
+
+    private Task<HttpOperationResponse<TResource>> CreatePortableWatchResponseAsync(CancellationToken cancellationToken)
+        => CreateResponseAsync<TResource>(
+            watch: true,
+            limit: null,
+            allowWatchBookmarks: true,
+            continueParameter: null,
+            resourceVersion: _lastResourceVersion,
+            cancellationToken: cancellationToken);
 
     private void OnEvent(WatchEventType watchEventType, TResource item)
     {
@@ -1278,6 +1419,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
     private void ReportCallbackFailure(Exception error)
         => CallbackFailedLog(Logger, typeof(TResource).Name, error);
+
+    private void ReportRegistrationBacklog()
+        => RegistrationBacklogLog(Logger, typeof(TResource).Name, Registration.MaxQueuedNotifications, null);
 }
 
 

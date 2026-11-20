@@ -23,7 +23,7 @@ Use it to keep application state synchronized with resources such as Pods, Deplo
 dotnet add package KubernetesClient.Informer
 ```
 
-The library targets .NET 10 and .NET 11. `AddKubernetesCore()` uses the default Kubernetes client configuration, which reads the local kubeconfig when available or in-cluster configuration when running in Kubernetes. You can also register your own `IKubernetes` client before calling `AddKubernetesCore()`, including a client without credentials for an unauthenticated API server.
+The library targets .NET 10 and .NET 11. `AddKubernetesCore()` uses the default Kubernetes client configuration, which reads the local kubeconfig when available or in-cluster configuration when running in Kubernetes. You can also register your own `IKubernetes` client before calling `AddKubernetesCore()`, including a client without credentials for an unauthenticated API server. WatchList bootstrap requires the concrete `Kubernetes` client; other `IKubernetes` implementations fall back to a portable list-and-watch. The one-shot WatchList bootstrap is capped at 30 seconds even if a longer `timeoutSeconds` is configured for the long-lived watch.
 
 ## Quick start
 
@@ -90,4 +90,4 @@ services.AddOpenTelemetry()
     .WithTracing(tracing => tracing.AddSource(InformerDiagnostics.ActivitySourceName));
 ```
 
-Activities cover informer lifecycle, Kubernetes resource listing, watch connections, and individual watch events. They include resource group, version, kind, namespace, and event details where available.
+Activities cover informer lifecycle, Kubernetes resource listing, watch connections, and individual watch events. They include resource group, version, kind, namespace, and event details where available. Exception events carry only the exception type — raw messages, stack traces, and API response bodies are intentionally excluded so resource data cannot leak into traces.

@@ -877,6 +877,40 @@ public class ResourceInformerTests
     }
 
     [Fact]
+    public async Task ForbiddenWatchListFaultsInformerInsteadOfRetrying()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+        {
+            if (request.RequestUri!.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
+            {
+                return Task.FromResult<HttpResponseMessage?>(new HttpResponseMessage(HttpStatusCode.Forbidden)
+                {
+                    Content = new StringContent("secret-body-marker"),
+                });
+            }
+
+            return Task.FromResult<HttpResponseMessage?>(null);
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        var thrown = await Assert.ThrowsAsync<HttpRequestException>(
+            () => runTask.WaitAsync(cancellation.Token).DefaultTimeout());
+        Assert.Equal(HttpStatusCode.Forbidden, thrown.StatusCode);
+        Assert.DoesNotContain("secret-body-marker", thrown.Message);
+        Assert.Empty(clusterHost.Cluster.ListRequests);
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
+    }
+
+    [Fact]
     public async Task WatchListEndingBeforeInitialEventsEndFallsBackWithoutPublishingPartialState()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -1005,7 +1039,7 @@ public class ResourceInformerTests
             if (!request.RequestUri!.Query.Contains("watch=true", StringComparison.Ordinal)
                 && Interlocked.Increment(ref listRequestCount) == 2)
             {
-                throw new InvalidOperationException("The second list page failed.");
+                throw new HttpRequestException("The second list page failed.");
             }
 
             return Task.FromResult<HttpResponseMessage?>(null);
@@ -1137,7 +1171,7 @@ public class ResourceInformerTests
             if (Interlocked.Increment(ref listRequestCount) == 4)
             {
                 relistPageFailed.TrySetResult();
-                throw new InvalidOperationException("The second relist page failed.");
+                throw new HttpRequestException("The second relist page failed.");
             }
 
             return Task.FromResult<HttpResponseMessage?>(null);
@@ -1275,6 +1309,227 @@ public class ResourceInformerTests
         }
 
         Assert.True(logger.SawObjectDisposed);
+    }
+
+    [Fact]
+    public async Task DisposalFailureDuringShutdownCompletesAsCancellation()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+        {
+            var query = request.RequestUri!.Query;
+            if (query.Contains("watch=true", StringComparison.Ordinal)
+                && !query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
+            {
+                cancellation.Cancel();
+                throw new ObjectDisposedException(nameof(IKubernetes));
+            }
+
+            return Task.FromResult<HttpResponseMessage?>(null);
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => runTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
+        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
+    }
+
+    [Fact]
+    public async Task UnexpectedListFailureFaultsInformerInsteadOfRetrying()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+        {
+            if (!request.RequestUri!.Query.Contains("watch=true", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("A programmer error, not a transient failure.");
+            }
+
+            return Task.FromResult<HttpResponseMessage?>(null);
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        informer.StartWatching();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => informer.RunAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
+    }
+
+    [Fact]
+    public async Task MalformedWatchFramesAreSkipped()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+        {
+            if (request.RequestUri!.Query.Contains("watch=true", StringComparison.Ordinal)
+                && !request.RequestUri.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
+            {
+                return Task.FromResult<HttpResponseMessage?>(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "\n{not json\n{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"valid\",\"resourceVersion\":\"1\"}}}\n"),
+                });
+            }
+
+            return Task.FromResult<HttpResponseMessage?>(null);
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.TrySetResult(pod.Name())));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        Assert.Equal("valid", await received.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    [Fact]
+    public async Task WatchListBootstrapTimeoutIsCapped()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        await clusterHost.StartAsync(cancellation.Token);
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance,
+            timeoutSeconds: 600);
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await clusterHost.Cluster.WaitForWatchListRequestAsync(1).DefaultTimeout();
+        Assert.Equal(30, clusterHost.Cluster.WatchListRequests.Single().TimeoutSeconds);
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    [Fact]
+    public async Task CustomIKubernetesUsesPortableWatchPath()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var customObjects = new Mock<ICustomObjectsOperations>();
+        customObjects
+            .Setup(x => x.ListClusterCustomObjectWithHttpMessagesAsync<KubernetesList<V1Pod>>(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool?>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<bool?>(),
+                It.IsAny<bool?>(), It.IsAny<IReadOnlyDictionary<string, IReadOnlyList<string>>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new HttpOperationResponse<KubernetesList<V1Pod>>
+            {
+                Body = new KubernetesList<V1Pod>(Array.Empty<V1Pod>(), "v1", V1PodList.KubeKind,
+                    new V1ListMeta { ResourceVersion = "1" }),
+            });
+        customObjects
+            .Setup(x => x.ListClusterCustomObjectWithHttpMessagesAsync<V1Pod>(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool?>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int?>(),
+                It.Is<bool?>(watch => watch == true),
+                It.IsAny<bool?>(), It.IsAny<IReadOnlyDictionary<string, IReadOnlyList<string>>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new HttpOperationResponse<V1Pod>
+            {
+                Request = new HttpRequestMessage(HttpMethod.Get, "http://fake/watch"),
+                Response = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"portable\",\"resourceVersion\":\"2\"}}}\n"),
+                },
+            });
+        var client = new Mock<IKubernetes>();
+        client.SetupGet(x => x.CustomObjects).Returns(customObjects.Object);
+        client.SetupGet(x => x.BaseUri).Returns(new Uri("http://fake"));
+
+        using var informer = new ResourceInformer<V1Pod>(
+            client.Object,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.TrySetResult(pod.Name())));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        Assert.Equal("portable", await received.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    [Fact]
+    public async Task ExceptionTelemetryDoesNotExportMessages()
+    {
+        var activities = new List<Activity>();
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => string.Equals(source.Name, InformerDiagnostics.ActivitySourceName, StringComparison.Ordinal),
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            SampleUsingParentId = (ref ActivityCreationOptions<string> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = activities.Add,
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+            throw new InvalidOperationException("SECRET-API-RESPONSE-BODY");
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        informer.StartWatching();
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => informer.RunAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+        Assert.NotEmpty(activities);
+        Assert.All(activities, activity =>
+        {
+            Assert.DoesNotContain("SECRET-API-RESPONSE-BODY", activity.StatusDescription, StringComparison.Ordinal);
+            Assert.All(activity.Events, evt => Assert.All(evt.Tags, tag =>
+                Assert.DoesNotContain("SECRET-API-RESPONSE-BODY", tag.Value?.ToString() ?? string.Empty, StringComparison.Ordinal)));
+        });
     }
 
     [Fact]
@@ -3127,10 +3382,23 @@ public class ResourceInformerTests
         }
 
         await secondListRequested.Task.DefaultTimeout();
-        await timeProvider.WaitForTimerCountAsync(1, cancellation.Token).DefaultTimeout();
-        for (var timer = 0; timer < timeProvider.TimerCount && !thirdListRequested.Task.IsCompleted; timer++)
+        // The retry timer is created by an async continuation, so it may not exist yet when
+        // the failure is observed. Poll for it instead of firing timers in a single pass.
+        var firedTimers = new HashSet<int>();
+        using var retryPoll = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!thirdListRequested.Task.IsCompleted && !retryPoll.IsCancellationRequested)
         {
-            timeProvider.FireTimer(timer);
+            for (var timer = 0; timer < timeProvider.TimerCount; timer++)
+            {
+                // Retry backoff is seconds; the watch idle timer is 45s and the bootstrap is 30s.
+                if (!firedTimers.Contains(timer) && timeProvider.GetTimerDueTime(timer) < TimeSpan.FromSeconds(5))
+                {
+                    firedTimers.Add(timer);
+                    timeProvider.FireTimer(timer);
+                }
+            }
+
+            await Task.Delay(10, cancellation.Token);
         }
 
         await thirdListRequested.Task.DefaultTimeout();
