@@ -84,12 +84,37 @@ public class ResourceApiController : ControllerBase
         if (parameters.Watch == true)
         {
             await _testCluster.ListResourcesAsync(string.Empty, Version, Plural, parameters);
+            Response.ContentType = "application/json";
+            if (_testCluster.WatchStreamGate is { } streamGate)
+            {
+                var firstEvent = _testCluster.WatchEvents.FirstOrDefault();
+                if (firstEvent is not null)
+                {
+                    _testCluster.WatchEvents.Remove(firstEvent);
+                    await Response.WriteAsync(JsonSerializer.Serialize(firstEvent));
+                    await Response.WriteAsync("\n");
+                }
+
+                await Response.Body.FlushAsync(HttpContext.RequestAborted);
+                _testCluster.MarkWatchStreamFirstEventSent();
+
+                // Intentionally not tied to RequestAborted: the test releases this gate after
+                // the client has cancelled so it can abort the connection mid-read.
+                await streamGate;
+                if (_testCluster.AbortWatchStream)
+                {
+                    HttpContext.Abort();
+                    _testCluster.MarkWatchStreamAborted();
+                }
+
+                return new EmptyResult();
+            }
+
             if (_testCluster.WatchResponseGate is { } watchResponseGate)
             {
                 await watchResponseGate.WaitAsync(HttpContext.RequestAborted);
             }
 
-            Response.ContentType = "application/json";
             foreach (var watchEvent in _testCluster.WatchEvents.ToArray())
             {
                 await Response.WriteAsync(JsonSerializer.Serialize(watchEvent));

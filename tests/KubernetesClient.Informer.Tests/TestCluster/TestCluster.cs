@@ -98,6 +98,24 @@ public class TestCluster : ITestCluster
 
     public Task? WatchResponseGate { get; set; }
 
+    private readonly TaskCompletionSource _watchStreamFirstEventSent = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task WatchStreamFirstEventSent => _watchStreamFirstEventSent.Task;
+
+    public Task? WatchStreamGate { get; set; }
+
+    public void MarkWatchStreamFirstEventSent() => _watchStreamFirstEventSent.TrySetResult();
+
+    public bool AbortWatchStream { get; set; }
+
+    private readonly TaskCompletionSource _watchStreamAborted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task WatchStreamAborted => _watchStreamAborted.Task;
+
+    public void MarkWatchStreamAborted() => _watchStreamAborted.TrySetResult();
+
+    public Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage?>>? RequestHandler { get; set; }
+
     public TestCluster(IOptions<TestClusterOptions> options)
     {
         ArgumentNullException.ThrowIfNull(options);

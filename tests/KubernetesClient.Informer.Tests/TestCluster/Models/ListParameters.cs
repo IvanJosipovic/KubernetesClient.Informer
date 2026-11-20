@@ -39,4 +39,7 @@ public class ListParameters
 
     [FromQuery]
     public string? Pretty { get; set; }
+
+    [FromRoute]
+    public string? Namespace { get; set; }
 }
