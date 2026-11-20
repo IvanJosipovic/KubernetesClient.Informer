@@ -105,10 +105,28 @@ public class ResourceInformerLifecycleTests
         var runTask = informer.RunInfinite(cancellation.Token);
 
         await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.Equal(cancellation.Token, informer.ObservedToken);
+        // RunInfinite links the caller's token with the hosted-service lifetime, so the token
+        // handed to RunAsync is a linked token that stays cancellable from either source.
+        Assert.True(informer.ObservedToken.CanBeCanceled);
+        Assert.False(informer.ObservedToken.IsCancellationRequested);
 
         cancellation.Cancel();
         await runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.True(informer.ObservedToken.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task DisposeStopsRunInfinite()
+    {
+        using var informer = new CancellationAwareInformer();
+        var runTask = informer.RunInfinite(CancellationToken.None);
+
+        await informer.TokenObserved.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        informer.Dispose();
+
+        // RunInfinite treats a linked-token cancellation as a clean stop and returns normally.
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
     }
 
     [Fact]

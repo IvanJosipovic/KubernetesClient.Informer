@@ -75,6 +75,11 @@ public abstract class BackgroundHostedService : IHostedService, IDisposable
     protected ILogger Logger { get; set; }
 
     /// <summary>
+    /// Gets the token that is canceled when the host stops or the service is disposed.
+    /// </summary>
+    protected CancellationToken RunCancellationToken => _runCancellation.Token;
+
+    /// <summary>
     /// Triggered when the application host is ready to start the service.
     /// </summary>
     /// <param name="cancellationToken">Indicates that the start process has been aborted.</param>

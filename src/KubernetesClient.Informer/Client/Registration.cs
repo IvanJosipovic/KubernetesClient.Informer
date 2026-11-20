@@ -12,6 +12,12 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
 {
     internal sealed class Registration : IResourceInformerRegistration
     {
+        // A stalled consumer must not grow memory without bound. Only live watch events count
+        // toward this limit: the one-shot cache replay (initial sync, relist, or late registration)
+        // is bounded by the informer cache itself and must never be truncated, because a silently
+        // dropped snapshot event would leave ReadyAsync successful with an incomplete cache.
+        internal const int MaxQueuedNotifications = 10_000;
+
         private readonly Channel<Notification> _notifications = Channel.CreateUnbounded<Notification>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -21,8 +27,9 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
         private readonly TaskCompletionSource _initialDelivery = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly bool _waitForInformerSync;
         private int _disposedValue;
+        private int _queuedCount;
 
-        private readonly record struct Notification(WatchEventType? EventType, TResource? Resource, bool IsReadyMarker);
+        private readonly record struct Notification(WatchEventType? EventType, TResource? Resource, bool IsReadyMarker, bool IsInitial);
 
         public Registration(ResourceInformer<TResource> resourceInformer, ResourceInformerCallback<TResource> callback, bool waitForInformerSync)
         {
@@ -47,10 +54,31 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
         }
 
         internal void Enqueue(WatchEventType eventType, TResource resource)
-            => _notifications.Writer.TryWrite(new Notification(eventType, resource, IsReadyMarker: false));
+        {
+            if (Volatile.Read(ref _disposedValue) != 0)
+            {
+                return;
+            }
+
+            if (Interlocked.Increment(ref _queuedCount) > MaxQueuedNotifications)
+            {
+                Interlocked.Decrement(ref _queuedCount);
+                ResourceInformer.ReportRegistrationBacklog();
+                Dispose();
+                return;
+            }
+
+            if (!_notifications.Writer.TryWrite(new Notification(eventType, resource, IsReadyMarker: false, IsInitial: false)))
+            {
+                Interlocked.Decrement(ref _queuedCount);
+            }
+        }
+
+        internal void EnqueueInitial(WatchEventType eventType, TResource resource)
+            => _notifications.Writer.TryWrite(new Notification(eventType, resource, IsReadyMarker: false, IsInitial: true));
 
         internal void EnqueueReady()
-            => _notifications.Writer.TryWrite(new Notification(EventType: null, Resource: null, IsReadyMarker: true));
+            => _notifications.Writer.TryWrite(new Notification(EventType: null, Resource: null, IsReadyMarker: true, IsInitial: false));
 
         internal void Complete()
         {
@@ -88,6 +116,13 @@ public partial class ResourceInformer<TResource> where TResource : class, IKuber
                         }
 
                         return;
+                    }
+                    finally
+                    {
+                        if (!notification.IsInitial)
+                        {
+                            Interlocked.Decrement(ref _queuedCount);
+                        }
                     }
                 }
             }

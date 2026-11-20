@@ -4,7 +4,7 @@ These diagrams describe `ResourceInformer<TResource>` only; they exclude host st
 
 ## `RunAsync`
 
-`RunAsync` waits for `StartWatching()` before requesting resources. It publishes the initial cache and completes `ReadyAsync()` only after every list page succeeds and initial callbacks finish. A failed page publishes neither partial cache contents nor callbacks; retryable failures restart the whole list. HTTP and Kubernetes status failures with status 429 or 5xx are retried; status 410 triggers a full relist, while other status failures fault the run. Retry delays use bounded exponential backoff with jitter and honor Kubernetes `Retry-After` where available. A watch lasting at least one minute is considered sustained and resets the consecutive retry backoff if it then fails; normal watch completion also resets it.
+`RunAsync` waits for `StartWatching()` before requesting resources. It publishes the initial cache and completes `ReadyAsync()` only after every list page succeeds and initial callbacks finish. A failed page publishes neither partial cache contents nor callbacks; retryable failures restart the whole list. HTTP and Kubernetes status failures with status 429 or 5xx are retried; status 410 triggers a full relist, while other status failures fault the run. Bare `HttpRequestException` failures are retried when they carry no status code (transport errors) or a retryable status; 401/403/404 fault immediately rather than retrying forever. Only known transient exception categories are retried — unexpected exceptions (null references, invalid operations, etc.) fault the run. Retry delays use bounded exponential backoff with jitter and honor Kubernetes `Retry-After` where available. A watch lasting at least one minute is considered sustained and resets the consecutive retry backoff if it then fails; normal watch completion also resets it. The WatchList bootstrap request and stream are capped at 30 seconds even when a longer watch timeout is configured; the cap ends at the initial-events bookmark and does not bound callback delivery. A malformed, nonblank watch frame is a recovery boundary: bootstrap falls back to a full list, and a regular watch reconnects from the last successfully processed resource version instead of accepting a later bookmark.
 
 ```mermaid
 flowchart TD
@@ -39,7 +39,7 @@ flowchart TD
 
 ## `RunInfinite`
 
-`RunInfinite` calls `StartWatching()` and repeatedly invokes `RunAsync`. Retryable list/watch failures are normally handled inside `RunAsync`; any other retryable non-cancellation exception that escapes is logged once with EventId 110 and retried with bounded backoff. Non-retryable HTTP or Kubernetes status failures fault the run instead of being retried. The retry log uses the same severity classifier as list/watch failures. Cancellation by the supplied token stops the informer; an unrelated `OperationCanceledException` is treated as a fault and escapes.
+`RunInfinite` calls `StartWatching()` and repeatedly invokes `RunAsync`. Retryable list/watch failures are normally handled inside `RunAsync`; any other retryable non-cancellation exception that escapes is logged once with EventId 110 and retried with bounded backoff. Non-retryable HTTP or Kubernetes status failures fault the run instead of being retried. Unexpected (non-transient) exceptions are retried for resilience but fault after three consecutive failures so a persistent defect cannot spin forever. The retry log uses the same severity classifier as list/watch failures. Cancellation by the supplied token — or by disposing the informer — stops the informer cleanly; an unrelated `OperationCanceledException` is treated as a fault and escapes. For clients other than the concrete `Kubernetes` client, WatchList is skipped and a portable `IKubernetes` watch is used.
 
 ```mermaid
 flowchart TD
@@ -57,7 +57,7 @@ flowchart TD
 
 ## Registrations and callbacks
 
-Registrations can be added at any time. A registration added before the initial cache is committed participates in the initial delivery. A later registration asynchronously replays the current cache as `Added`, followed by subsequent events. Each registration has an asynchronous single-reader queue, preserving its event order; registrations may run concurrently. `ReadyAsync()` waits for initial delivery or late-cache replay. A callback exception is logged with Error and EventId 111, then only that registration is removed; it does not fault the informer. Relist-generated deletions carry the last full object observed by the informer.
+Registrations can be added at any time. A registration added before the initial cache is committed participates in the initial delivery. A later registration asynchronously replays the current cache as `Added`, followed by subsequent events. Each registration has an asynchronous single-reader queue, preserving its event order; registrations may run concurrently. A registration whose live-event backlog exceeds 10,000 queued notifications is removed (EventId 112) so a stalled consumer cannot grow memory without bound; one-shot cache replay (initial sync, relist, or late registration) is exempt from that limit so a large cache is never silently truncated. `ReadyAsync()` waits for initial delivery or late-cache replay. A callback exception is logged with Error and EventId 111, then only that registration is removed; it does not fault the informer. Relist-generated deletions carry the last full object observed by the informer.
 
 ## Log levels and operational criticality
 
@@ -72,9 +72,10 @@ List and watch request failures share EventId 104 (`ReceivedError`). The watch-s
 | **Information** | 104 `ReceivedError` for 410 / expired resource version | Expected recovery; the informer backs off and performs a full relist. |
 | **Information** | 105 `WatchingStopped` | `RunAsync` observed cancellation from its supplied token. |
 | **Warning** | 104 `ReceivedError` for transport errors, timeouts, 429, or 5xx | Transient failure is being retried; exception and retry delay are included. |
-| **Error** | 104 `ReceivedError` for other 4xx or unexpected failures | Actionable or unexpected failure; it is still retried by the current list/watch contract. |
+| **Error** | 104 `ReceivedError` for other 4xx or unexpected failures | Actionable failure; non-retryable statuses and unexpected exception types fault the run. |
 | **Warning / Error / Information** | 110 `WatchingRetryScheduled` | `RunInfinite` retries an exception that escaped `RunAsync`; severity reflects the same failure classification. |
 | **Error** | 109 `WatchingFailed` | `RunAsync` exits faulted. This is suppressed inside `RunInfinite` when EventId 110 will report and retry the exception. |
 | **Error** | 111 `CallbackFailed` | One event callback failed; only that registration is removed. |
+| **Error** | 112 `RegistrationBacklog` | A registration's notification queue exceeded its limit; the registration was removed. |
 
 There are no Critical-level logs in `ResourceInformer<TResource>`. `StartWatching()` and `ReadyAsync()` do not log directly.
