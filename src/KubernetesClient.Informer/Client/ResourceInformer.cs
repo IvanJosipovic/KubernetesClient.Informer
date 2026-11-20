@@ -304,6 +304,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 await _start.Task.WaitAsync(runCancellationToken).ConfigureAwait(false);
 
                 await RunListWatchAsync(runCancellationToken).ConfigureAwait(true);
+
+                // The reconnect loop ends as soon as cancellation is requested, which can happen
+                // between two iterations without any awaited operation throwing. Surface that
+                // cancellation here so RunAsync always reports it to its caller.
+                runCancellationToken.ThrowIfCancellationRequested();
             }
             catch (OperationCanceledException) when (runCancellationToken.IsCancellationRequested)
             {
