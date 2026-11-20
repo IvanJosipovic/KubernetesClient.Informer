@@ -1007,10 +1007,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         if (kubernetes.HttpClient is null)
         {
-            // Kubernetes.Dispose() clears HttpClient. A host may dispose the client while our
-            // reconnect loop is still unwinding; treat that as shutdown rather than a fault.
-            cancellationToken.ThrowIfCancellationRequested();
-            throw new InvalidOperationException("The Kubernetes client has been disposed; direct watch requests are unavailable.");
+            // Kubernetes.Dispose() clears HttpClient. Report disposal honestly; the host is
+            // responsible for stopping informers before disposing their client.
+            throw new ObjectDisposedException(nameof(IKubernetes), "The Kubernetes client has been disposed; direct watch requests are unavailable.");
         }
 
         return await kubernetes.HttpClient.SendAsync(
