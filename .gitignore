@@ -416,3 +416,16 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Agent Package Manager
+apm_modules/
+.claude/
+.codex/
+.gemini/
+.opencode/
+.agents/
+.github/agents/
+.github/mcp.json
+.github/lsp.json
+.mcp.json
+opencode.json

@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using Microsoft.AspNetCore.Http;
+using System.Net.Http;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using KubernetesClient.Informer.Tests.TestCluster.Models;
@@ -45,4 +46,29 @@ public interface ITestCluster
     IList<WatchEvent> WatchEvents { get; }
 
     Task? WatchResponseGate { get; set; }
+
+    /// <summary>
+    /// When set, the watch controller writes one event, flushes it, signals
+    /// <see cref="WatchStreamFirstEventSent"/>, then waits for this gate before
+    /// either aborting the connection or completing the response.
+    /// </summary>
+    Task? WatchStreamGate { get; set; }
+
+    Task WatchStreamFirstEventSent { get; }
+
+    void MarkWatchStreamFirstEventSent();
+
+    /// <summary>Abort the connection after <see cref="WatchStreamGate"/> is released.</summary>
+    bool AbortWatchStream { get; set; }
+
+    Task WatchStreamAborted { get; }
+
+    void MarkWatchStreamAborted();
+
+    /// <summary>
+    /// Intercepts a client request before it reaches the HTTP server. Return a response to
+    /// serve it from the test, or <see langword="null"/> to fall through to the server.
+    /// Throwing an exception surfaces it directly to the informer transport.
+    /// </summary>
+    Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage?>>? RequestHandler { get; set; }
 }

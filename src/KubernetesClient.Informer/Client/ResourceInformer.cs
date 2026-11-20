@@ -8,7 +8,6 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
-using System.Runtime.ExceptionServices;
 using System.Text;
 using k8s;
 using k8s.Autorest;
@@ -305,6 +304,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 await _start.Task.WaitAsync(runCancellationToken).ConfigureAwait(false);
 
                 await RunListWatchAsync(runCancellationToken).ConfigureAwait(true);
+
+                // The reconnect loop ends as soon as cancellation is requested, which can happen
+                // between two iterations without any awaited operation throwing. Surface that
+                // cancellation here so RunAsync always reports it to its caller.
+                runCancellationToken.ThrowIfCancellationRequested();
             }
             catch (OperationCanceledException) when (runCancellationToken.IsCancellationRequested)
             {
@@ -933,6 +937,70 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         }
     }
 
+    /// <summary>
+    /// Sends a watch request through KubernetesClient's configured transport instead of using
+    /// WatcherExt. Its AttachCancellationToken uses a cancellable ContinueWith that abandons the
+    /// pending read, leaving an unobserved exception when the stream is later aborted.
+    /// </summary>
+    private async Task<HttpResponseMessage> CreateWatchResponseAsync(CancellationToken cancellationToken)
+    {
+        if (Client is not Kubernetes kubernetes)
+        {
+            throw new InvalidOperationException("A Kubernetes client is required for direct watch requests.");
+        }
+
+        var path = new StringBuilder();
+        if (string.IsNullOrEmpty(_groupApiVersionKind.Group))
+        {
+            path.Append("api/");
+        }
+        else
+        {
+            path.Append("apis/")
+                .Append(Uri.EscapeDataString(_groupApiVersionKind.Group))
+                .Append('/');
+        }
+
+        path.Append(Uri.EscapeDataString(_groupApiVersionKind.ApiVersion));
+        if (!string.IsNullOrEmpty(_namespace))
+        {
+            path.Append("/namespaces/").Append(Uri.EscapeDataString(_namespace));
+        }
+
+        path.Append('/').Append(Uri.EscapeDataString(_groupApiVersionKind.PluralName));
+
+        var query = new List<string>
+        {
+            "watch=true",
+            "allowWatchBookmarks=true",
+            $"resourceVersion={Uri.EscapeDataString(_lastResourceVersion ?? string.Empty)}",
+        };
+        if (_timeoutSeconds is > 0)
+        {
+            query.Add($"timeoutSeconds={_timeoutSeconds.Value}");
+        }
+
+        if (_selector?.FieldSelector is { } fieldSelector)
+        {
+            query.Add($"fieldSelector={Uri.EscapeDataString(fieldSelector)}");
+        }
+
+        var baseUri = Client.BaseUri.ToString().TrimEnd('/') + "/";
+        var requestUri = new Uri(new Uri(baseUri, UriKind.Absolute), $"{path}?{string.Join('&', query)}");
+        using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        request.Headers.Accept.ParseAdd("application/json");
+
+        if (kubernetes.Credentials is { } credentials)
+        {
+            await credentials.ProcessHttpRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+
+        return await kubernetes.HttpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken).ConfigureAwait(false);
+    }
+
     private sealed class WatchListUnsupportedException : Exception
     {
     }
@@ -1089,22 +1157,22 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             }
         }, state: null, dueTime: TimeSpan.FromSeconds(45), period: TimeSpan.FromSeconds(45));
 
-        var watchWithHttpMessage = CreateResponseAsync<TResource>(
-            watch: true,
-            limit: null,
-            allowWatchBookmarks: true,
-            continueParameter: null,
-            resourceVersion: _lastResourceVersion,
-            cancellationToken: reconnectCancellationTokenSource.Token);
-
-#pragma warning disable CS0618 // Type or member is obsolete
         try
         {
-            await foreach (var (eventType, resource) in watchWithHttpMessage.WatchAsync<TResource, TResource>((e) =>
-#pragma warning restore CS0618 // Type or member is obsolete
+            // Read the response ourselves so the token is observed by the awaited read.
+            using var response = await CreateWatchResponseAsync(reconnectCancellationTokenSource.Token).ConfigureAwait(true);
+            if (!response.IsSuccessStatusCode)
             {
-                ExceptionDispatchInfo.Capture(e).Throw();
-            }, reconnectCancellationTokenSource.Token))
+                var body = await response.Content.ReadAsStringAsync(reconnectCancellationTokenSource.Token).ConfigureAwait(false);
+                throw new HttpOperationException($"Watch request failed with status {(int)response.StatusCode} ({response.StatusCode})")
+                {
+                    Response = new HttpResponseMessageWrapper(response, body),
+                };
+            }
+
+            await foreach (var (eventType, resource) in ReadWatchEventsAsync(
+                response.Content,
+                reconnectCancellationTokenSource.Token).ConfigureAwait(true))
             {
                 lastEventUtc = _timeProvider.GetUtcNow();
                 OnEvent(eventType, resource);
@@ -1194,3 +1262,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     private void ReportCallbackFailure(Exception error)
         => CallbackFailedLog(Logger, typeof(TResource).Name, error);
 }
+
+
+
+
+
+
+
+

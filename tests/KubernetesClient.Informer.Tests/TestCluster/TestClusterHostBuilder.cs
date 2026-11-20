@@ -77,9 +77,11 @@ public class TestClusterHostBuilder
 
         var clientConfiguration = KubernetesClientConfiguration.BuildConfigFromConfigObject(kubeConfig);
 
-        var client = new k8s.Kubernetes(clientConfiguration);
-
-        return new TestClusterHost(host, kubeConfig, client);
+        var requestHandler = new TestClusterRequestHandler();
+        var client = new k8s.Kubernetes(clientConfiguration, requestHandler);
+        var testClusterHost = new TestClusterHost(host, kubeConfig, client);
+        requestHandler.Cluster = testClusterHost.Cluster;
+        return testClusterHost;
     }
 
     public TestClusterHostBuilder UseInitialResources(params IKubernetesObject<V1ObjectMeta>[] resources)

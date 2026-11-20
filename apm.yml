@@ -1,0 +1,41 @@
+# $schema: https://microsoft.github.io/apm/specs/schemas/manifest-v0.1.48.schema.json
+name: informer
+version: 1.0.0
+description: Agent config
+author: Ivan Josipovic
+# Which agent platforms to deploy to.
+# Resolution order: --target flag > this field > auto-detect from filesystem.
+# Accepted values: agent-skills, antigravity, claude, codex, copilot, cursor, gemini, grok-bot, grok-build, hermes, kiro, opencode, vscode, windsurf
+targets:
+- claude
+- codex
+- copilot
+- opencode
+dependencies:
+  apm:
+    - github.com/cloudflare/security-audit-skill/skills/security-audit
+    - github.com/JuliusBrussee/caveman/skills/caveman
+    - github.com/Aaronontheweb/dotnet-skills/skills/ilspy-decompile
+    - github.com/microsoft/DebugMCP/skills/debug-live
+    - github.com/debugmcp/mcp-debugger/skills/debugging
+    - github.com/dotnet/skills/plugins/dotnet
+    - github.com/dotnet/skills/plugins/dotnet11
+    - github.com/dotnet/skills/plugins/dotnet-diag
+  mcp:
+    - name: roslyn-codelens-mcp
+      registry: false
+      transport: stdio
+      command: dnx
+      args: ["RoslynCodeLens.Mcp", "--yes"]
+    - name: microsoft-learn
+      registry: false
+      transport: http
+      url: https://learn.microsoft.com/api/mcp
+    - name: mcp-debugger
+      registry: false
+      transport: stdio
+      command: npx
+      args: ["-y", "@debugmcp/mcp-debugger", "stdio"]
+  lsp: []
+includes: auto
+scripts: {}
