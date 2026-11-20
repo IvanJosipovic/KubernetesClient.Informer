@@ -35,11 +35,11 @@ The review found **no critical vulnerabilities**, but did identify one high-seve
 |---|---|
 | F1 | `HttpRequestException` is now classified by status code (`IsRetryable(HttpRequestException)`): transport failures with no status stay retryable, while 401/403/404 fault immediately. Added `ForbiddenWatchListFaultsInformerInsteadOfRetrying`. |
 | F2 | The list/watch catch-all now only retries known transient exception categories (`IsTransientForRetry`); unexpected exceptions fault. `RunInfinite` still retries unexpected failures for resilience but faults after three consecutive ones. |
-| F3 | Registrations track queue depth; a backlog over 10,000 notifications removes the registration and logs EventId 112 instead of growing memory without bound. |
+| F3 | Registrations track the live-event queue depth; a backlog over 10,000 notifications removes the registration and logs EventId 112. One-shot cache replay is exempt so large caches are never truncated. |
 | F4 | WatchList error messages no longer embed the API response body, and `InformerDiagnostics.RecordException` exports only the exception type (no message/stack trace). |
 | F5 | Added a portable `IKubernetes` watch path (`CreatePortableWatchResponseAsync`); the direct optimized path is still used for the concrete `Kubernetes` client, and WatchList is skipped for other implementations. |
 | F6 | Idle-watch tracking now uses interlocked 64-bit ticks instead of a torn-prone captured `DateTimeOffset`. |
-| F7 | Watch frames are null/blank-line checked and malformed JSON is skipped instead of surfacing as NRE-driven retries. |
+| F7 | Blank lines are skipped; malformed nonblank frames raise a recovery exception — bootstrap falls back to a full list and regular watches reconnect from the last successfully processed resource version. |
 | F8 | WatchList bootstrap timeout is capped at 30 seconds (short configured values are still honored); query and cancellation now agree. |
 | F9 | `RunInfinite` links the caller's token with the hosted-service run token, so `Dispose()` stops a manually driven loop. Added `DisposeStopsRunInfinite`. |
 
@@ -335,12 +335,7 @@ Primary error-handling gaps are F1, F2, and F8.
 
 ## 6. Test coverage observations
 
-The suite is broad (WatchList bootstrap/fallback/bookmark atomicity, pagination, 410 relist, Retry-After, backoff reset, callback isolation, disposal linearizability, diagnostics). Gaps corresponding to the findings above:
-
-- No test for a 401/403/404 returned by the **WatchList** endpoint (F1).
-- No test for a custom non-`Kubernetes` `IKubernetes` implementation (F5).
-- No test for malformed/null watch frames (F7).
-- No backpressure/queue-depth coverage for slow callbacks (F3).
+The suite is broad (WatchList bootstrap/fallback/bookmark atomicity, pagination, 410 relist, Retry-After, backoff reset, callback isolation, disposal linearizability, diagnostics). The original gaps have since been closed by regression tests: forbidden WatchList responses (F1), a custom non-`Kubernetes` `IKubernetes` client (F5), malformed WatchList and watch frames (F7), queue-depth overflow for slow live callbacks, and a cache replay larger than the live-event limit (F3).
 
 ## 7. Recommended remediation order
 

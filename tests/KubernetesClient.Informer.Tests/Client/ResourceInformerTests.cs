@@ -1370,19 +1370,27 @@ public class ResourceInformerTests
     }
 
     [Fact]
-    public async Task MalformedWatchFramesAreSkipped()
+    public async Task MalformedWatchFrameReconnectsFromLastGoodResourceVersion()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         using var clusterHost = new TestClusterHostBuilder().Build();
+        var watchRequestCount = 0;
+        var requestedResourceVersions = new List<string?>();
         clusterHost.Cluster.RequestHandler = (request, _) =>
         {
             if (request.RequestUri!.Query.Contains("watch=true", StringComparison.Ordinal)
                 && !request.RequestUri.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
             {
+                requestedResourceVersions.Add(request.RequestUri.Query
+                    .Split('&', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(part => part.Split('=', 2))
+                    .FirstOrDefault(part => part[0] == "resourceVersion")?.ElementAtOrDefault(1));
+                var attempt = Interlocked.Increment(ref watchRequestCount);
                 return Task.FromResult<HttpResponseMessage?>(new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new StringContent(
-                        "\n{not json\n{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"valid\",\"resourceVersion\":\"1\"}}}\n"),
+                    Content = new StringContent(attempt == 1
+                        ? "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"before\",\"resourceVersion\":\"1\"}}}\n{not json\n"
+                        : "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"after\",\"resourceVersion\":\"2\"}}}\n"),
                 });
             }
 
@@ -1394,13 +1402,172 @@ public class ResourceInformerTests
             clusterHost.Client,
             Mock.Of<IHostApplicationLifetime>(),
             NullLogger<ResourceInformer<V1Pod>>.Instance);
-        var received = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var received = new List<string>();
+        var secondEvent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
-            received.TrySetResult(pod.Name())));
+        {
+            lock (received)
+            {
+                // The fake watch repeats its last response on every reconnect; only the first
+                // two deliveries matter for this assertion.
+                if (received.Count < 2)
+                {
+                    received.Add(pod.Name());
+                    if (received.Count == 2)
+                    {
+                        secondEvent.TrySetResult();
+                    }
+                }
+            }
+        }));
         var runTask = informer.RunAsync(cancellation.Token);
         informer.StartWatching();
 
-        Assert.Equal("valid", await received.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        await secondEvent.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(["before", "after"], received);
+        Assert.True(watchRequestCount >= 2);
+        // Reconnect must resume from the last well-formed event, not skip past the damaged one.
+        Assert.Equal("1", requestedResourceVersions[1]);
+
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    [Fact]
+    public async Task MalformedWatchListFrameFallsBackToListWithoutPublishingPartialState()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "listed" } })
+            .Build();
+        clusterHost.Cluster.WatchListSupported = true;
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+        {
+            if (request.RequestUri!.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
+            {
+                return Task.FromResult<HttpResponseMessage?>(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"partial\",\"resourceVersion\":\"1\"}}}\n{not json\n"),
+                });
+            }
+
+            return Task.FromResult<HttpResponseMessage?>(null);
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new List<string>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.Add(pod.Name())));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+        Assert.Equal(["listed"], received);
+        Assert.Single(clusterHost.Cluster.ListRequests);
+
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    [Fact]
+    public async Task LateRegistrationReplaysCacheLargerThanLiveQueueLimit()
+    {
+        const int resourceCount = 10_001;
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var resources = Enumerable.Range(0, resourceCount)
+            .Select(i => (IKubernetesObject<V1ObjectMeta>)new V1Pod
+            {
+                Metadata = new V1ObjectMeta { Name = $"pod-{i}" },
+            })
+            .ToArray();
+        using var clusterHost = new TestClusterHostBuilder().UseInitialResources(resources).Build();
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+        await informer.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        var delivered = 0;
+        using var lateRegistration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            Interlocked.Increment(ref delivered)));
+        await lateRegistration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Equal(resourceCount, delivered);
+
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    [Fact]
+    public async Task LiveEventBacklogRemovesRegistrationAndLogsEvent()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        var frames = string.Concat(Enumerable.Range(0, 10_001).Select(i =>
+            "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"pod-" +
+            i + "\",\"resourceVersion\":\"" + (i + 1) + "\"}}}\n"));
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+        {
+            if (request.RequestUri!.Query.Contains("watch=true", StringComparison.Ordinal)
+                && !request.RequestUri.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
+            {
+                return Task.FromResult<HttpResponseMessage?>(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(frames),
+                });
+            }
+
+            return Task.FromResult<HttpResponseMessage?>(null);
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        var logger = new BacklogObserverLogger();
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            logger);
+        var firstCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+        {
+            firstCallback.TrySetResult();
+            releaseCallback.Task.GetAwaiter().GetResult();
+        }));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await firstCallback.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await logger.BacklogLogged.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        releaseCallback.TrySetResult();
+        Assert.Equal(112, logger.ObservedEventId.Id);
+
         cancellation.Cancel();
         try
         {
@@ -4106,6 +4273,28 @@ public class ResourceInformerTests
             {
                 SawObjectDisposed = true;
                 _observed.TrySetResult();
+            }
+        }
+    }
+
+    private sealed class BacklogObserverLogger : ILogger<ResourceInformer<V1Pod>>
+    {
+        private readonly TaskCompletionSource _backlogLogged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task BacklogLogged => _backlogLogged.Task;
+
+        public EventId ObservedEventId { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == LogLevel.Error && eventId.Id == 112)
+            {
+                ObservedEventId = eventId;
+                _backlogLogged.TrySetResult();
             }
         }
     }

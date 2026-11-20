@@ -246,9 +246,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
             if (_initialListCompleted)
             {
+                // The initial snapshot is queued before Start so its order is preserved.
+                // It is exempt from the live-event backlog limit so large caches are not truncated.
                 foreach (var resource in _cache.Values)
                 {
-                    registration.Enqueue(WatchEventType.Added, resource);
+                    registration.EnqueueInitial(WatchEventType.Added, resource);
                 }
 
                 registration.EnqueueReady();
@@ -604,6 +606,13 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             activity?.SetStatus(ActivityStatusCode.Error, "WatchList bootstrap timed out.");
             return false;
         }
+        catch (MalformedWatchEventException)
+        {
+            // A damaged frame means the snapshot cannot be trusted. Fall back to a full list
+            // rather than committing a partial cache and advancing the resource version.
+            activity?.SetStatus(ActivityStatusCode.Error, "The WatchList stream contained a malformed event.");
+            return false;
+        }
     }
 
     private async Task<bool> TryWatchListCoreAsync(
@@ -691,9 +700,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
 
         while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
-            // A watch stream can contain blank lines or malformed frames (for example when a
-            // proxy injects data). Skip them instead of letting a null dereference turn into an
-            // endless retry loop in the caller.
+            // Blank lines are harmless framing noise and can be skipped. A nonblank frame that
+            // cannot be parsed is different: silently dropping it would let a later bookmark
+            // advance the resource version past an object we never observed.
             if (string.IsNullOrWhiteSpace(line))
             {
                 continue;
@@ -704,20 +713,25 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             {
                 genericEvent = KubernetesJson.Deserialize<Watcher<KubernetesObject>.WatchEvent>(line);
             }
-            catch (JsonException)
+            catch (JsonException error)
             {
-                continue;
+                throw new MalformedWatchEventException("The watch stream contained an unparseable event.", error);
             }
 
-            if (genericEvent?.Object?.Kind == "Status")
+            if (genericEvent?.Object is not { } genericObject)
+            {
+                throw new MalformedWatchEventException("The watch stream contained an event without an object.");
+            }
+
+            if (genericObject.Kind == "Status")
             {
                 var statusEvent = KubernetesJson.Deserialize<Watcher<V1Status>.WatchEvent>(line);
-                if (statusEvent?.Object is { } status)
+                if (statusEvent?.Object is not { } status)
                 {
-                    throw new KubernetesException(status);
+                    throw new MalformedWatchEventException("The watch stream contained an incomplete status event.");
                 }
 
-                continue;
+                throw new KubernetesException(status);
             }
 
             Watcher<TResource>.WatchEvent? watchEvent;
@@ -725,14 +739,14 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             {
                 watchEvent = KubernetesJson.Deserialize<Watcher<TResource>.WatchEvent>(line);
             }
-            catch (JsonException)
+            catch (JsonException error)
             {
-                continue;
+                throw new MalformedWatchEventException("The watch stream contained an unparseable resource event.", error);
             }
 
             if (watchEvent?.Object is not { } resource)
             {
-                continue;
+                throw new MalformedWatchEventException("The watch stream contained a resource event without an object.");
             }
 
             yield return (watchEvent.Type, resource);
@@ -1137,6 +1151,17 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
     {
     }
 
+    // A nonblank, unparseable frame is a recovery boundary: continuing past it would let a
+    // later bookmark advance the resource version and lose the object it represented.
+    // Deriving from IOException keeps the existing transient-retry classification.
+    private sealed class MalformedWatchEventException : IOException
+    {
+        public MalformedWatchEventException(string message, Exception? innerException = null)
+            : base(message, innerException)
+        {
+        }
+    }
+
     private async Task ListAsync(CancellationToken cancellationToken)
     {
         using var activity = InformerDiagnostics.ActivitySource.StartActivity(nameof(ListAsync), ActivityKind.Client);
@@ -1217,7 +1242,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 var eventType = previousCache.ContainsKey(NamespacedName.From(item))
                     ? WatchEventType.Modified
                     : WatchEventType.Added;
-                EnqueueRegistrationCallbacks(registrations, eventType, item);
+                EnqueueInitialCallbacks(registrations, eventType, item);
             }
 
             foreach (var (key, item) in previousCache)
@@ -1228,7 +1253,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 }
 
                 // Reuse the last-known object so delete handlers retain the resource's full state.
-                EnqueueRegistrationCallbacks(registrations, WatchEventType.Deleted, item);
+                EnqueueInitialCallbacks(registrations, WatchEventType.Deleted, item);
             }
 
             foreach (var registration in registrations)
@@ -1407,6 +1432,14 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         activity?.SetTag("k8s.resource.kind", _groupApiVersionKind.Kind);
         activity?.SetTag("k8s.resource.plural", _groupApiVersionKind.PluralName);
         activity?.SetTag("k8s.namespace.name", _namespace);
+    }
+
+    private static void EnqueueInitialCallbacks(ImmutableList<Registration> registrations, WatchEventType eventType, TResource resource)
+    {
+        foreach (var registration in registrations)
+        {
+            registration.EnqueueInitial(eventType, resource);
+        }
     }
 
     private static void EnqueueRegistrationCallbacks(ImmutableList<Registration> registrations, WatchEventType eventType, TResource resource)
