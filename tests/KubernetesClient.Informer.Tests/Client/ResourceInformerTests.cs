@@ -877,10 +877,12 @@ public class ResourceInformerTests
     }
 
     [Fact]
-    public async Task ForbiddenWatchListFaultsInformerInsteadOfRetrying()
+    public async Task ForbiddenWatchListFallsBackToList()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var clusterHost = new TestClusterHostBuilder().Build();
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "listed" } })
+            .Build();
         clusterHost.Cluster.RequestHandler = (request, _) =>
         {
             if (request.RequestUri!.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
@@ -899,15 +901,98 @@ public class ResourceInformerTests
             clusterHost.Client,
             Mock.Of<IHostApplicationLifetime>(),
             NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new ConcurrentQueue<(WatchEventType EventType, string Name)>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.Enqueue((eventType, pod.Name()))));
         var runTask = informer.RunAsync(cancellation.Token);
         informer.StartWatching();
 
-        var thrown = await Assert.ThrowsAsync<HttpRequestException>(
-            () => runTask.WaitAsync(cancellation.Token).DefaultTimeout());
-        Assert.Equal(HttpStatusCode.Forbidden, thrown.StatusCode);
-        Assert.DoesNotContain("secret-body-marker", thrown.Message);
-        Assert.Empty(clusterHost.Cluster.ListRequests);
-        Assert.Equal(ResourceInformerStatus.Faulted, informer.Status);
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Single(clusterHost.Cluster.ListRequests);
+        Assert.Equal([(WatchEventType.Added, "listed")], received.ToArray());
+        Assert.Equal(ResourceInformerStatus.Running, informer.Status);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.MethodNotAllowed)]
+    [InlineData(HttpStatusCode.NotImplemented)]
+    public async Task UnsupportedWatchListStatusFallsBackToList(HttpStatusCode statusCode)
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder()
+            .UseInitialResources(new V1Pod { Metadata = new V1ObjectMeta { Name = "listed" } })
+            .Build();
+        clusterHost.Cluster.RequestHandler = (request, _) =>
+        {
+            if (request.RequestUri!.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
+            {
+                return Task.FromResult<HttpResponseMessage?>(new HttpResponseMessage(statusCode)
+                {
+                    Content = new StringContent("unsupported"),
+                });
+            }
+
+            return Task.FromResult<HttpResponseMessage?>(null);
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var received = new ConcurrentQueue<(WatchEventType EventType, string Name)>();
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) =>
+            received.Enqueue((eventType, pod.Name()))));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await registration.ReadyAsync(cancellation.Token).DefaultTimeout();
+
+        Assert.Single(clusterHost.Cluster.ListRequests);
+        Assert.Equal([(WatchEventType.Added, "listed")], received.ToArray());
+        Assert.Equal(ResourceInformerStatus.Running, informer.Status);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runTask);
+    }
+
+    [Fact]
+    public async Task RunInfiniteStopsCleanlyWhenWatchListFailsAfterCancellation()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        var requestEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRequest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        clusterHost.Cluster.RequestHandler = async (request, _) =>
+        {
+            if (request.RequestUri!.Query.Contains("sendInitialEvents=true", StringComparison.Ordinal))
+            {
+                requestEntered.TrySetResult();
+                await releaseRequest.Task.WaitAsync(TestContext.Current.CancellationToken);
+                throw new ObjectDisposedException(nameof(IKubernetes));
+            }
+
+            return null;
+        };
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        var runTask = informer.RunInfinite(cancellation.Token);
+        await requestEntered.Task.WaitAsync(cancellation.Token).DefaultTimeout();
+
+        cancellation.Cancel();
+        releaseRequest.TrySetResult();
+
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
     }
 
     [Fact]
