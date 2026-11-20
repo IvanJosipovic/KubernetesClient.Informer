@@ -1244,6 +1244,35 @@ public class ResourceInformerTests
         Assert.All(clusterHost.Cluster.ListRequests, request => Assert.Equal("test-namespace", request.Namespace));
     }
     [Fact]
+    public async Task DisposedClientDuringWatchReconnectCompletesCleanly()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        await clusterHost.StartAsync(cancellation.Token);
+
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            NullLogger<ResourceInformer<V1Pod>>.Instance);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) => { }));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await registration.ReadyAsync(CancellationToken.None).DefaultTimeout();
+        await clusterHost.Cluster.WatchRequested.DefaultTimeout();
+
+        clusterHost.Client.Dispose();
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    [Fact]
     public async Task WatchRequestsIncludeBookmarks()
     {
         using var cancellation = new CancellationTokenSource(Debugger.IsAttached ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(5));
