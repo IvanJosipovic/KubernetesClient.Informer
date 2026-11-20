@@ -891,6 +891,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             query.Add($"fieldSelector={Uri.EscapeDataString(fieldSelector)}");
         }
 
+        if (Client.BaseUri is null)
+        {
+            throw new InvalidOperationException("The Kubernetes client has no BaseUri for direct watch requests.");
+        }
+
         var baseUri = Client.BaseUri.ToString().TrimEnd('/') + "/";
         var requestUri = new Uri(new Uri(baseUri, UriKind.Absolute), $"{path}?{string.Join('&', query)}");
         var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
@@ -985,6 +990,11 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             query.Add($"fieldSelector={Uri.EscapeDataString(fieldSelector)}");
         }
 
+        if (Client.BaseUri is null)
+        {
+            throw new InvalidOperationException("The Kubernetes client has no BaseUri for direct watch requests.");
+        }
+
         var baseUri = Client.BaseUri.ToString().TrimEnd('/') + "/";
         var requestUri = new Uri(new Uri(baseUri, UriKind.Absolute), $"{path}?{string.Join('&', query)}");
         using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
@@ -993,6 +1003,13 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
         if (kubernetes.Credentials is { } credentials)
         {
             await credentials.ProcessHttpRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (kubernetes.HttpClient is null)
+        {
+            // Kubernetes.Dispose() clears HttpClient. Report disposal honestly; the host is
+            // responsible for stopping informers before disposing their client.
+            throw new ObjectDisposedException(nameof(IKubernetes), "The Kubernetes client has been disposed; direct watch requests are unavailable.");
         }
 
         return await kubernetes.HttpClient.SendAsync(

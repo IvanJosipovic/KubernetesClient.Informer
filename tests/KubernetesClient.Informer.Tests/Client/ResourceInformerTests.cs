@@ -1244,6 +1244,40 @@ public class ResourceInformerTests
         Assert.All(clusterHost.Cluster.ListRequests, request => Assert.Equal("test-namespace", request.Namespace));
     }
     [Fact]
+    public async Task DisposedClientDuringWatchReconnectReportsObjectDisposed()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var clusterHost = new TestClusterHostBuilder().Build();
+        await clusterHost.StartAsync(cancellation.Token);
+
+        var logger = new DisposalCaptureLogger();
+        using var informer = new ResourceInformer<V1Pod>(
+            clusterHost.Client,
+            Mock.Of<IHostApplicationLifetime>(),
+            logger);
+        using var registration = informer.Register((ResourceInformerCallback<V1Pod>)((eventType, pod) => { }));
+        var runTask = informer.RunAsync(cancellation.Token);
+        informer.StartWatching();
+
+        await registration.ReadyAsync(CancellationToken.None).DefaultTimeout();
+        await clusterHost.Cluster.WatchRequested.DefaultTimeout();
+
+        // The fake watch ends immediately; the following reconnect uses the disposed client.
+        clusterHost.Client.Dispose();
+        await logger.Observed.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        cancellation.Cancel();
+        try
+        {
+            await runTask.DefaultTimeout();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        Assert.True(logger.SawObjectDisposed);
+    }
+
+    [Fact]
     public async Task WatchRequestsIncludeBookmarks()
     {
         using var cancellation = new CancellationTokenSource(Debugger.IsAttached ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(5));
@@ -3093,6 +3127,7 @@ public class ResourceInformerTests
         }
 
         await secondListRequested.Task.DefaultTimeout();
+        await timeProvider.WaitForTimerCountAsync(1, cancellation.Token).DefaultTimeout();
         for (var timer = 0; timer < timeProvider.TimerCount && !thirdListRequested.Task.IsCompleted; timer++)
         {
             timeProvider.FireTimer(timer);
@@ -3783,6 +3818,28 @@ public class ResourceInformerTests
         await runTask;
 
         Assert.Equal(ResourceInformerStatus.Stopped, informer.Status);
+    }
+
+    private sealed class DisposalCaptureLogger : ILogger<ResourceInformer<V1Pod>>
+    {
+        private readonly TaskCompletionSource _observed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Observed => _observed.Task;
+
+        public bool SawObjectDisposed { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (exception is ObjectDisposedException)
+            {
+                SawObjectDisposed = true;
+                _observed.TrySetResult();
+            }
+        }
     }
 
     private sealed class CallbackFailureObserverLogger : ILogger<ResourceInformer<V1Pod>>
