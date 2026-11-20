@@ -331,6 +331,22 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
                 WatchingStoppedLog(Logger, typeof(TResource).Name, null);
                 throw;
             }
+            catch (Exception error) when (runCancellationToken.IsCancellationRequested)
+            {
+                // Shutdown wins over any in-flight request failure. A disposal error or a late
+                // HTTP response that arrives just after cancellation is not a watch fault.
+                if (!isRunInfiniteInvocation)
+                {
+                    _ready.TrySetCanceled(runCancellationToken);
+                }
+
+                Status = ResourceInformerStatus.Stopped;
+                WatchingStoppedLog(Logger, typeof(TResource).Name, error);
+                throw new OperationCanceledException(
+                    "The watch stopped while a request was in flight.",
+                    error,
+                    runCancellationToken);
+            }
             catch (Exception error)
             {
                 if (!isRunInfiniteInvocation)
@@ -429,6 +445,13 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             _ready.TrySetCanceled(runToken);
             Status = ResourceInformerStatus.Stopped;
         }
+        catch (Exception error) when (runToken.IsCancellationRequested)
+        {
+            // A failure that lands after cancellation must not turn a clean shutdown into Faulted.
+            _ready.TrySetCanceled(runToken);
+            Status = ResourceInformerStatus.Stopped;
+            WatchingStoppedLog(Logger, typeof(TResource).Name, error);
+        }
         catch (Exception error)
         {
             _ready.TrySetException(error);
@@ -520,10 +543,9 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             }
             catch (HttpRequestException ex)
             {
-                // Transport-level failures have no status code and are transient. A status code
-                // that the server marks as non-retryable (401, 403, 404, ...) must fault instead
-                // of being retried forever — otherwise a WatchList RBAC failure never reaches the
-                // list fallback and ReadyAsync never completes.
+                // Failures from the WatchList bootstrap are handled in TryWatchListAsync and
+                // become a LIST fallback. This catch covers the LIST and WATCH requests; a
+                // non-retryable status there is a real failure and must fault the informer.
                 if (!IsRetryable(ex))
                 {
                     throw;
@@ -611,6 +633,17 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             // A damaged frame means the snapshot cannot be trusted. Fall back to a full list
             // rather than committing a partial cache and advancing the resource version.
             activity?.SetStatus(ActivityStatusCode.Error, "The WatchList stream contained a malformed event.");
+            return false;
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested
+            && ex is HttpRequestException or HttpOperationException or KubernetesException
+                or IOException or JsonException)
+        {
+            // WatchList is a best-effort bootstrap: any API, transport, or parse failure must
+            // fall back to LIST + WATCH. Only a failure of the fallback LIST should fault the
+            // informer, because only LIST can say whether the resource itself is unavailable.
+            activity?.SetStatus(ActivityStatusCode.Error, "WatchList bootstrap failed.");
+            InformerDiagnostics.RecordException(activity, ex);
             return false;
         }
     }
@@ -1029,8 +1062,7 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             if (!response.IsSuccessStatusCode)
             {
                 var responseBody = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-                if (response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.UnprocessableEntity
-                    && responseBody.Contains("sendInitialEvents", StringComparison.OrdinalIgnoreCase))
+                if (IsWatchListUnsupported(response.StatusCode, responseBody))
                 {
                     throw new WatchListUnsupportedException();
                 }
@@ -1056,6 +1088,16 @@ public partial class ResourceInformer<TResource> : BackgroundHostedService, INot
             throw;
         }
     }
+
+    // WatchList is an optional API optimization. A server that predates it, has the feature
+    // gate disabled, or sits behind a proxy that does not route the query answers 404/405/501.
+    // Those responses mean "unsupported", not "the resource is unavailable".
+    private static bool IsWatchListUnsupported(HttpStatusCode statusCode, string responseBody)
+        => statusCode is HttpStatusCode.NotFound
+            or HttpStatusCode.MethodNotAllowed
+            or HttpStatusCode.NotImplemented
+            || (statusCode is HttpStatusCode.BadRequest or HttpStatusCode.UnprocessableEntity
+                && responseBody.Contains("sendInitialEvents", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Sends a watch request through KubernetesClient's configured transport instead of using
